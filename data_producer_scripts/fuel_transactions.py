@@ -1,25 +1,37 @@
+import sys
+import os
+
+CURRENT_DIR = os.path.dirname(__file__)
+ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
 import csv
 import random
-import os
 from datetime import datetime, timedelta
 
+from config import (
+    VEHICLE_REGISTRY_FILE,
+    FUEL_FILE,
+    FUEL_CONFIG,
+    DATA_DIR
+)
+
 # ================================
-# CONFIG (PRODUCTION READY)
+# CONFIG (FROM CONFIG)
 # ================================
 
-BASE_DIR = os.path.dirname(__file__)
-
-# 🔥 Central data directory
-DATA_DIR = os.path.abspath(os.path.join(BASE_DIR, "../data"))
-
-# 🔥 Ensure folder exists (VERY IMPORTANT)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# File paths
-REGISTRY_FILE = os.path.join(DATA_DIR, "vehicle_registry.csv")
-OUTPUT_FILE = os.path.join(DATA_DIR, "fuel_transactions.csv")
+REGISTRY_FILE = VEHICLE_REGISTRY_FILE
+OUTPUT_FILE = FUEL_FILE
 
-NUM_RECORDS = 5000
+NUM_RECORDS = FUEL_CONFIG["NUM_RECORDS"]
+MIN_FUEL = FUEL_CONFIG["MIN_FUEL"]
+MAX_FUEL = FUEL_CONFIG["MAX_FUEL"]
+MIN_DISTANCE = FUEL_CONFIG["MIN_DISTANCE"]
+MAX_DISTANCE = FUEL_CONFIG["MAX_DISTANCE"]
 
 # ================================
 # LOAD VINs
@@ -50,18 +62,16 @@ def generate_data(vins):
 
     base_date = datetime(2026, 1, 1)
 
-    # 🔥 Track odometer per vehicle (VERY IMPORTANT)
     odometer_map = {vin: random.randint(10000, 50000) for vin in vins}
 
     for _ in range(NUM_RECORDS):
 
         vin = random.choice(vins)
 
-        # Increment odometer (time-series behavior)
-        distance = random.randint(100, 500)
+        distance = random.randint(MIN_DISTANCE, MAX_DISTANCE)
         odometer_map[vin] += distance
 
-        fuel_liters = round(random.uniform(20, 150), 2)
+        fuel_liters = round(random.uniform(MIN_FUEL, MAX_FUEL), 2)
 
         timestamp = base_date + timedelta(
             days=random.randint(0, 120),
@@ -91,23 +101,19 @@ def add_edge_cases(data, vins):
 
     total = len(data)
 
-    # 1. Duplicate (~1%)
     for _ in range(int(total * 0.01)):
         data.append(random.choice(data).copy())
 
-    # 2. Invalid fuel (~0.5%)
     for _ in range(int(total * 0.005)):
         row = random.choice(data).copy()
         row["fuel_liters"] = random.choice([0, -10])
         data.append(row)
 
-    # 3. Odometer rollback (~0.5%)
     for _ in range(int(total * 0.005)):
         row = random.choice(data).copy()
         row["odometer_reading"] -= random.randint(100, 500)
         data.append(row)
 
-    # 4. Invalid VIN (~0.5%)
     for _ in range(int(total * 0.005)):
         data.append({
             "transaction_id": f"TXN_BAD_{random.randint(1000,9999)}",
@@ -117,7 +123,6 @@ def add_edge_cases(data, vins):
             "timestamp": "2026-04-10 10:00:00"
         })
 
-    # 5. Missing fuel (~0.5%)
     for _ in range(int(total * 0.005)):
         row = random.choice(data).copy()
         row["fuel_liters"] = ""
@@ -139,7 +144,7 @@ def write_csv(data):
         writer.writeheader()
         writer.writerows(data)
 
-    print(f"Generated {len(data)} rows → {OUTPUT_FILE}")
+    print(f"Generated {len(data)} rows  {OUTPUT_FILE}")
 
 
 # ================================

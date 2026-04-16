@@ -1,15 +1,22 @@
-import subprocess
-import os
 import sys
+import os
+
+CURRENT_DIR = os.path.dirname(__file__)
+ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
+import subprocess
 
 # ================================
 # BASE PATH (PRODUCTION READY)
 # ================================
 
-BASE_DIR = os.path.dirname(__file__)
+BASE_DIR = ROOT_DIR
 
-DATA_SCRIPTS = os.path.abspath(os.path.join(BASE_DIR, "data_producer_scripts"))
-STREAMING_SCRIPTS = os.path.abspath(os.path.join(BASE_DIR, "streaming_data_producer"))
+DATA_SCRIPTS = os.path.join(BASE_DIR, "data_producer_scripts")
+STREAMING_SCRIPTS = os.path.join(BASE_DIR, "streaming_data_producer")
 
 PYTHON_EXEC = sys.executable
 
@@ -22,7 +29,6 @@ def run_script(script_path, name):
 
     print(f"\nRunning: {name}")
 
-    # 🔥 Check if script exists
     if not os.path.exists(script_path):
         print(f"ERROR: Script not found → {script_path}")
         sys.exit(1)
@@ -52,10 +58,6 @@ def main():
 
     print("\nSTARTING FULL DATA PIPELINE\n")
 
-    # ================================
-    # BATCH PIPELINE
-    # ================================
-
     scripts = [
         ("vehicle_registry.py", "Vehicle Registry"),
         ("vehicle_assignment.py", "Vehicle Assignment"),
@@ -68,10 +70,6 @@ def main():
         run_script(os.path.join(DATA_SCRIPTS, script), name)
 
     print("\nALL BATCH DATA GENERATED SUCCESSFULLY")
-
-    # ================================
-    # STREAMING PIPELINE (OPTIONAL)
-    # ================================
 
     start_stream = input("\nDo you want to start telemetry streaming? (y/n): ").strip().lower()
 

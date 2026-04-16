@@ -1,24 +1,42 @@
+import sys
+import os
+
+CURRENT_DIR = os.path.dirname(__file__)
+ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
 import json
 import time
 import random
 import csv
-import os
 from datetime import datetime
 from kafka import KafkaProducer
 
+from config import (
+    VEHICLE_REGISTRY_FILE,
+    VEHICLE_ASSIGNMENT_FILE,
+    TELEMETRY_CONFIG
+)
+
 # ================================
-# CONFIG
+# CONFIG (FROM CONFIG)
 # ================================
 
-BASE_DIR = os.path.dirname(__file__)
+REGISTRY_FILE = VEHICLE_REGISTRY_FILE
+ASSIGNMENT_FILE = VEHICLE_ASSIGNMENT_FILE
 
-REGISTRY_FILE = os.path.join(BASE_DIR, "../data/vehicle_registry.csv")
-ASSIGNMENT_FILE = os.path.join(BASE_DIR, "../data/vehicle_assignment.csv")
+KAFKA_TOPIC = TELEMETRY_CONFIG["KAFKA_TOPIC"]
+KAFKA_SERVER = TELEMETRY_CONFIG["KAFKA_SERVER"]
+EVENT_DELAY = TELEMETRY_CONFIG["EVENT_DELAY"]
 
-KAFKA_TOPIC = "vehicle_telemetry_topic"
-KAFKA_SERVER = "localhost:9092"
+LAT_RANGE = TELEMETRY_CONFIG["LAT_RANGE"]
+LONG_RANGE = TELEMETRY_CONFIG["LONG_RANGE"]
 
-EVENT_DELAY = 1   # seconds between events
+NORMAL_SPEED = TELEMETRY_CONFIG["NORMAL_SPEED"]
+HIGH_SPEED = TELEMETRY_CONFIG["HIGH_SPEED"]
+EXTREME_SPEED = TELEMETRY_CONFIG["EXTREME_SPEED"]
 
 # ================================
 # LOAD DATA
@@ -34,9 +52,6 @@ def load_vins():
 
 
 def load_active_assignments():
-    """
-    Load only ACTIVE drivers (end_timestamp = NULL)
-    """
     mapping = {}
 
     with open(ASSIGNMENT_FILE, "r") as f:
@@ -53,23 +68,18 @@ def load_active_assignments():
 # ================================
 
 def generate_event(vin, driver_id):
-    """
-    Generate realistic telemetry event
-    """
 
-    # Speed distribution
     r = random.random()
 
     if r < 0.80:
-        speed = random.randint(40, 100)   # normal
+        speed = random.randint(NORMAL_SPEED[0], NORMAL_SPEED[1])
     elif r < 0.95:
-        speed = random.randint(110, 130)  # violation
+        speed = random.randint(HIGH_SPEED[0], HIGH_SPEED[1])
     else:
-        speed = random.randint(130, 160)  # extreme
+        speed = random.randint(EXTREME_SPEED[0], EXTREME_SPEED[1])
 
-    # Delhi/NCR coordinates
-    lat = round(random.uniform(28.4, 28.9), 6)
-    long = round(random.uniform(76.8, 77.5), 6)
+    lat = round(random.uniform(LAT_RANGE[0], LAT_RANGE[1]), 6)
+    long = round(random.uniform(LONG_RANGE[0], LONG_RANGE[1]), 6)
 
     event = {
         "vin": vin,
@@ -110,12 +120,10 @@ def run_producer():
 
         vin = random.choice(vins)
 
-        # Get driver (fallback if missing)
-        driver_id = assignments.get(vin, f"DRV_UNKNOWN")
+        driver_id = assignments.get(vin, "DRV_UNKNOWN")
 
         event = generate_event(vin, driver_id)
 
-        # Send to Kafka
         producer.send(KAFKA_TOPIC, value=event)
 
         print(f"Sent: {event}")

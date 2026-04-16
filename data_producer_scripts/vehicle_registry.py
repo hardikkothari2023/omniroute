@@ -1,44 +1,40 @@
+import sys
+import os
+
+CURRENT_DIR = os.path.dirname(__file__)
+ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
 import csv
 import random
 import string
 from datetime import datetime
-import os
+
+from config import (
+    VEHICLE_REGISTRY_FILE,
+    VEHICLE_REGISTRY_CONFIG,
+    DATA_DIR
+)
 
 # ================================
-# CONFIGURATION (PRODUCTION READY)
+# CONFIGURATION (FROM CONFIG)
 # ================================
 
-BASE_DIR = os.path.dirname(__file__)
-
-# 🔥 Central data directory
-DATA_DIR = os.path.abspath(os.path.join(BASE_DIR, "../data"))
-
-# 🔥 Ensure folder exists (VERY IMPORTANT for EC2)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# File path
-OUTPUT_FILE = os.path.join(DATA_DIR, "vehicle_registry.csv")
+OUTPUT_FILE = VEHICLE_REGISTRY_FILE
 
-NUM_RECORDS = 256482
-
-MODELS = [
-    "Freightliner M2",
-    "Volvo VNL",
-    "Isuzu N-Series",
-    "Tata Ultra",
-    "Ashok Leyland Dost"
-]
-
-FUEL_TYPES = ["Diesel", "LNG", "CNG", "Electric"]
+NUM_RECORDS = VEHICLE_REGISTRY_CONFIG["NUM_RECORDS"]
+MODELS = VEHICLE_REGISTRY_CONFIG["MODELS"]
+FUEL_TYPES = VEHICLE_REGISTRY_CONFIG["FUEL_TYPES"]
 
 # ================================
 # HELPER FUNCTIONS
 # ================================
 
 def generate_vin(existing_vins):
-    """
-    Generate a unique VIN (8 chars alphanumeric)
-    """
     while True:
         vin = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
         if vin not in existing_vins:
@@ -90,16 +86,13 @@ def add_edge_cases(data):
 
     if len(data) > 2:
 
-        # 1. Duplicate VIN
         duplicate = data[0].copy()
         data.append(duplicate)
 
-        # 2. Missing mfg_year
         bad_record_1 = data[1].copy()
         bad_record_1["mfg_year"] = ""
         data.append(bad_record_1)
 
-        # 3. Invalid fuel_type
         bad_record_2 = data[2].copy()
         bad_record_2["fuel_type"] = "INVALID_FUEL"
         data.append(bad_record_2)

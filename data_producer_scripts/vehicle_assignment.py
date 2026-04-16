@@ -1,27 +1,34 @@
+import sys
+import os
+
+CURRENT_DIR = os.path.dirname(__file__)
+ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
 import csv
 import random
 from datetime import datetime, timedelta
-import os
+
+from config import (
+    VEHICLE_REGISTRY_FILE,
+    VEHICLE_ASSIGNMENT_FILE,
+    VEHICLE_ASSIGNMENT_CONFIG,
+    DATA_DIR
+)
 
 # ================================
-# CONFIG (PRODUCTION READY)
+# CONFIG (FROM CONFIG)
 # ================================
 
-BASE_DIR = os.path.dirname(__file__)
-
-# 🔥 Centralized data directory
-DATA_DIR = os.path.abspath(os.path.join(BASE_DIR, "../data"))
-
-# 🔥 Ensure data folder exists (VERY IMPORTANT)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# File paths
-REGISTRY_FILE = os.path.join(DATA_DIR, "vehicle_registry.csv")
-OUTPUT_FILE = os.path.join(DATA_DIR, "vehicle_assignment.csv")
+REGISTRY_FILE = VEHICLE_REGISTRY_FILE
+OUTPUT_FILE = VEHICLE_ASSIGNMENT_FILE
 
-NUM_ROWS = 20000
-
-REGIONS = ["North", "South", "East", "West", "Central", "NCR", "Mumbai", "Jaipur"]
+NUM_ROWS = VEHICLE_ASSIGNMENT_CONFIG["NUM_ROWS"]
+REGIONS = VEHICLE_ASSIGNMENT_CONFIG["REGIONS"]
 
 # ================================
 # LOAD VINs FROM REGISTRY
@@ -75,7 +82,13 @@ def generate_assignments(vins):
             driver_id = generate_driver_id(driver_counter)
             driver_counter += 1
 
-            daily_rate = round(random.uniform(300, 1200), 2)
+            daily_rate = round(
+                random.uniform(
+                    VEHICLE_ASSIGNMENT_CONFIG["MIN_RATE"],
+                    VEHICLE_ASSIGNMENT_CONFIG["MAX_RATE"]
+                ), 2
+            )
+
             region = random.choice(REGIONS)
 
             duration = random.randint(10, 60)
@@ -110,7 +123,6 @@ def add_edge_cases(data, vins):
 
     if len(data) > 3 and len(vins) > 3:
 
-        # Duplicate with different rate
         sample = data[0].copy()
         sample["daily_rate"] = 400
         data.append(sample)
@@ -119,7 +131,6 @@ def add_edge_cases(data, vins):
         dup["daily_rate"] = 600
         data.append(dup)
 
-        # Overlapping assignment
         data.append({
             "vin": vins[1],
             "driver_id": "DRV_OVER1",
@@ -138,7 +149,6 @@ def add_edge_cases(data, vins):
             "region": "North"
         })
 
-        # Invalid VIN
         data.append({
             "vin": "INVALID123",
             "driver_id": "DRV_BAD",
@@ -164,7 +174,7 @@ def write_csv(data):
         writer.writeheader()
         writer.writerows(data)
 
-    print(f"Generated {len(data)} rows → {OUTPUT_FILE}")
+    print(f"Generated {len(data)} rows  {OUTPUT_FILE}")
 
 
 # ================================

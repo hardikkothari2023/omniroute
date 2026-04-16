@@ -1,23 +1,33 @@
-import json
+import sys
 import os
+
+CURRENT_DIR = os.path.dirname(__file__)
+ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
+import json
 import random
 
+from config import (
+    RESTRICTED_ZONES_FILE,
+    ZONES_CONFIG,
+    DATA_DIR
+)
+
 # ================================
-# CONFIG (PRODUCTION READY)
+# CONFIG (FROM CONFIG)
 # ================================
 
-BASE_DIR = os.path.dirname(__file__)
-
-# 🔥 Central data directory
-DATA_DIR = os.path.abspath(os.path.join(BASE_DIR, "../data"))
-
-# 🔥 Ensure folder exists (VERY IMPORTANT)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# File path
-OUTPUT_FILE = os.path.join(DATA_DIR, "restricted_zones.json")
+OUTPUT_FILE = RESTRICTED_ZONES_FILE
 
-NUM_ZONES = 8  # recommended 5–10
+NUM_ZONES = ZONES_CONFIG["NUM_ZONES"]
+LAT_RANGE = ZONES_CONFIG["LAT_RANGE"]
+LONG_RANGE = ZONES_CONFIG["LONG_RANGE"]
+OFFSET_RANGE = ZONES_CONFIG["OFFSET_RANGE"]
 
 # ================================
 # REALISTIC ZONE NAMES
@@ -44,11 +54,11 @@ def generate_zones():
 
     for _ in range(NUM_ZONES):
 
-        center_lat = random.uniform(28.5, 28.8)
-        center_long = random.uniform(77.0, 77.4)
+        center_lat = random.uniform(LAT_RANGE[0], LAT_RANGE[1])
+        center_long = random.uniform(LONG_RANGE[0], LONG_RANGE[1])
 
-        lat_offset = random.uniform(0.01, 0.03)
-        long_offset = random.uniform(0.01, 0.03)
+        lat_offset = random.uniform(OFFSET_RANGE[0], OFFSET_RANGE[1])
+        long_offset = random.uniform(OFFSET_RANGE[0], OFFSET_RANGE[1])
 
         zone = {
             "zone_name": random.choice(ZONE_NAMES),
@@ -69,7 +79,6 @@ def generate_zones():
 
 def add_edge_cases(zones):
 
-    # 1. Overlapping zones
     zones.append({
         "zone_name": "Overlap Zone",
         "min_lat": 28.55,
@@ -86,7 +95,6 @@ def add_edge_cases(zones):
         "max_long": 77.15
     })
 
-    # 2. Invalid coordinates
     zones.append({
         "zone_name": "Invalid Zone",
         "min_lat": 200,
@@ -95,10 +103,8 @@ def add_edge_cases(zones):
         "max_long": 600
     })
 
-    # 3. Empty zone
     zones.append({})
 
-    # 4. Too large zone
     zones.append({
         "zone_name": "Too Large Zone",
         "min_lat": 28.0,
@@ -119,7 +125,7 @@ def write_json(data):
     with open(OUTPUT_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
-    print(f"Generated {len(data)} zones → {OUTPUT_FILE}")
+    print(f"Generated {len(data)} zones  {OUTPUT_FILE}")
 
 
 # ================================
