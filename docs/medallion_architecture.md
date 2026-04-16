@@ -20,12 +20,15 @@
                     ══════════════╪════════════════════════╪═════════════
                                   ▼                        ▼
                     ┌─────────────────────────────────────────────────────┐
-                    │               🥉 BRONZE LAYER (Raw)                │
-                    │         s3://omniroute-data-lake/raw/               │
+                    │               🥉 BRONZE LAYER                      │
+                    │         s3://omniroute-bronze/                      │
                     │                                                     │
-                    │  Exact copy of source data in Parquet format        │
-                    │  Partitioned by ingestion date (dt=YYYY-MM-DD)      │
-                    │  No transformations, no dedup, no schema changes    │
+                    │  landing/    → raw CSVs dropped by upstream         │
+                    │  ingested/   → validated & converted to Parquet     │
+                    │  quarantine/ → unknown files or bad formats         │
+                    │                                                     │
+                    │  Flow: landing → validate → ingested (or quarantine)│
+                    │  Source CSVs deleted from landing after ingestion   │
                     └──────────────────────────┬──────────────────────────┘
                                                │
                     ══════════════════════════╪═══════════════════════════
@@ -79,12 +82,23 @@ flowchart TD
     end
 
     subgraph Bronze["🥉 Bronze Layer"]
-        B1["bronze.vehicle_registry"]
-        B2["bronze.vehicle_assignment"]
-        B3["bronze.maintenance_schedules"]
-        B4["bronze.fuel_transactions"]
-        B5["bronze.telemetry_raw"]
-        B6["bronze.restricted_zones"]
+        direction TB
+        subgraph Landing["landing/"]
+            L1["Raw CSVs"]
+        end
+        subgraph Ingested["ingested/"]
+            B1["vehicle_registry"]
+            B2["vehicle_assignment"]
+            B3["maintenance_schedules"]
+            B4["fuel_transactions"]
+            B5["telemetry_raw"]
+            B6["restricted_zones"]
+        end
+        subgraph Quarantine["quarantine/"]
+            Q1["Unknown / bad files"]
+        end
+        L1 -->|validate| Ingested
+        L1 -->|reject| Quarantine
     end
 
     subgraph Silver["🥈 Silver Layer"]
@@ -110,12 +124,17 @@ flowchart TD
         R4["rpt.driver_safety_penalty"]
     end
 
-    S1 --> B1 --> V1
-    S2 --> B2 --> V2
-    S3 --> B3 --> V3
-    S4 --> B4 --> V4
-    S5 --> B5 --> V5
+    S1 --> L1
+    S2 --> L1
+    S3 --> L1
+    S4 --> L1
+    S5 --> B5
     S6 --> B6
+    B1 --> V1
+    B2 --> V2
+    B3 --> V3
+    B4 --> V4
+    B5 --> V5
 
     V1 --> G1
     V2 --> G1
@@ -136,13 +155,40 @@ flowchart TD
 
 ---
 
-## 🥉 Bronze Layer (Raw)
+## 🥉 Bronze Layer
 
-**Path:** `s3://omniroute-data-lake/raw/<table_name>/dt=YYYY-MM-DD/`  
-**Format:** Parquet  
-**Principle:** Exact copy of source data. No transformations. Schema matches source 1:1.
+**Bucket:** `s3://omniroute-bronze/`  
+**Format:** CSV (landing) → Parquet (ingested)  
+**Principle:** Validate and convert source data. No business logic, no dedup, no schema changes.
 
-### bronze.vehicle_registry
+### Bronze Folder Structure
+
+| Folder | Purpose | Contents |
+|---|---|---|
+| `landing/` | Drop zone for raw source CSVs | Upstream systems upload files here |
+| `ingested/` | Validated data converted to Parquet | Partitioned by `dt=YYYY-MM-DD` |
+| `quarantine/` | Rejected files | Unknown filenames, unexpected formats, corrupt files |
+
+### Bronze Ingestion Flow
+
+```
+landing/*.csv  →  Ingestion Job  →  ingested/<table>/dt=YYYY-MM-DD/  (success)
+                       │
+                       └──────────→  quarantine/dt=YYYY-MM-DD/       (failure)
+
+                  On success: DELETE source CSV from landing/
+```
+
+**Validation checks before ingestion:**
+1. Is the filename recognized? (vehicle_registry, vehicle_assignment, etc.)
+2. Is the file format CSV?
+3. Does the schema match the expected columns?
+4. If any check fails → move file to `quarantine/`
+
+> [!NOTE]
+> Kafka telemetry bypasses `landing/` entirely — it streams directly into `ingested/telemetry_raw/`.
+
+### ingested/vehicle_registry
 
 | Column | Type | Source |
 |---|---|---|
@@ -156,7 +202,7 @@ flowchart TD
 
 ---
 
-### bronze.vehicle_assignment
+### ingested/vehicle_assignment
 
 | Column | Type | Source |
 |---|---|---|
@@ -172,7 +218,7 @@ flowchart TD
 
 ---
 
-### bronze.maintenance_schedules
+### ingested/maintenance_schedules
 
 | Column | Type | Source |
 |---|---|---|
@@ -185,7 +231,7 @@ flowchart TD
 
 ---
 
-### bronze.fuel_transactions
+### ingested/fuel_transactions
 
 | Column | Type | Source |
 |---|---|---|
@@ -200,7 +246,7 @@ flowchart TD
 
 ---
 
-### bronze.telemetry_raw
+### ingested/telemetry_raw
 
 | Column | Type | Source |
 |---|---|---|
@@ -211,12 +257,12 @@ flowchart TD
 | `long` | FLOAT | Kafka JSON |
 | `event_timestamp` | TIMESTAMP | Kafka timestamp |
 
-- **Ingestion:** Continuous (Spark Structured Streaming from Kafka)
+- **Ingestion:** Continuous (Spark Structured Streaming from Kafka) — bypasses `landing/`
 - **Partition:** `dt` (event date), `hour`
 
 ---
 
-### bronze.restricted_zones
+### ingested/restricted_zones
 
 | Column | Type | Source |
 |---|---|---|
@@ -617,8 +663,14 @@ flowchart LR
 ## Storage Layout on S3
 
 ```
-s3://omniroute-data-lake/
-├── raw/                                    # 🥉 Bronze
+s3://omniroute-bronze/                          # 🥉 Bronze
+├── landing/                                    # Raw CSVs dropped here
+│   ├── vehicle_registry.csv
+│   ├── vehicle_assignment.csv
+│   ├── maintenance_schedules.csv
+│   └── fuel_transactions.csv
+│
+├── ingested/                                   # Validated → Parquet
 │   ├── vehicle_registry/dt=2026-04-15/
 │   ├── vehicle_assignment/dt=2026-04-15/
 │   ├── maintenance_schedules/dt=2026-01-01/
@@ -626,21 +678,26 @@ s3://omniroute-data-lake/
 │   ├── telemetry_raw/dt=2026-04-15/hour=06/
 │   └── restricted_zones/
 │
-├── silver/                                 # 🥈 Silver
+└── quarantine/                                 # Rejected files
+    └── dt=2026-04-15/
+        └── unknown_file.xlsx
+
+s3://omniroute-data-lake/
+├── silver/                                     # 🥈 Silver
 │   ├── vehicle_registry_clean/
 │   ├── vehicle_assignment_clean/
 │   ├── maintenance_schedules/
 │   ├── fuel_transactions_enriched/
 │   └── telemetry_validated/
 │
-├── gold/                                   # 🥇 Gold
+├── gold/                                       # 🥇 Gold
 │   ├── asset_history_scd2/
 │   ├── fuel_efficiency_audit/
 │   ├── active_fleet_snapshot/
 │   ├── safety_violations/
 │   └── driver_safety_status/
 │
-└── reports/                                # 📊 Exports
+└── reports/                                    # 📊 Exports
     ├── monthly_rate_deduction/
     ├── safety_compliance_summary/
     └── active_fleet_snapshot/
