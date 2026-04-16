@@ -17,7 +17,8 @@ from kafka import KafkaProducer
 from config import (
     VEHICLE_REGISTRY_FILE,
     VEHICLE_ASSIGNMENT_FILE,
-    TELEMETRY_CONFIG
+    TELEMETRY_CONFIG,
+    RESTRICTED_ZONES_FILE
 )
 
 # ================================
@@ -53,33 +54,54 @@ def load_vins():
 
 def load_active_assignments():
     mapping = {}
+    current_time = int(time.time())
 
     with open(ASSIGNMENT_FILE, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if row["end_timestamp"] == "":
+            end_ts = row["end_timestamp"]
+            if end_ts == "" or (end_ts.isdigit() and int(end_ts) > current_time):
                 mapping[row["vin"]] = row["driver_id"]
 
     return mapping
+
+
+def load_restricted_zones():
+    zones = []
+    if os.path.exists(RESTRICTED_ZONES_FILE):
+        with open(RESTRICTED_ZONES_FILE, "r") as f:
+            data = json.load(f)
+            for z in data:
+                if "min_lat" in z:
+                    zones.append(z)
+    return zones
 
 
 # ================================
 # GENERATE TELEMETRY EVENT
 # ================================
 
-def generate_event(vin, driver_id):
+def generate_event(vin, driver_id, zones):
 
     r = random.random()
 
     if r < 0.80:
         speed = random.randint(NORMAL_SPEED[0], NORMAL_SPEED[1])
+        force_intrusion = False
     elif r < 0.95:
         speed = random.randint(HIGH_SPEED[0], HIGH_SPEED[1])
+        force_intrusion = (random.random() < 0.5) and len(zones) > 0
     else:
         speed = random.randint(EXTREME_SPEED[0], EXTREME_SPEED[1])
+        force_intrusion = len(zones) > 0
 
-    lat = round(random.uniform(LAT_RANGE[0], LAT_RANGE[1]), 6)
-    long = round(random.uniform(LONG_RANGE[0], LONG_RANGE[1]), 6)
+    if force_intrusion and zones:
+        zone = random.choice(zones)
+        lat = round(random.uniform(zone["min_lat"], zone["max_lat"]), 6)
+        long = round(random.uniform(zone["min_long"], zone["max_long"]), 6)
+    else:
+        lat = round(random.uniform(LAT_RANGE[0], LAT_RANGE[1]), 6)
+        long = round(random.uniform(LONG_RANGE[0], LONG_RANGE[1]), 6)
 
     event = {
         "vin": vin,
@@ -110,24 +132,26 @@ def run_producer():
 
     vins = load_vins()
     assignments = load_active_assignments()
+    zones = load_restricted_zones()
 
     print(f"Loaded {len(vins)} vehicles")
     print(f"Loaded {len(assignments)} active assignments")
+    print(f"Loaded {len(zones)} restricted zones")
 
-    print("Starting telemetry stream...\n")
+    print("Starting telemetry stream in batches...\n")
+    BATCH_SIZE = 50
 
     while True:
+        batch_events = []
+        for _ in range(BATCH_SIZE):
+            vin = random.choice(vins)
+            driver_id = assignments.get(vin, "DRV_UNKNOWN")
 
-        vin = random.choice(vins)
+            event = generate_event(vin, driver_id, zones)
+            producer.send(KAFKA_TOPIC, value=event)
+            batch_events.append(event)
 
-        driver_id = assignments.get(vin, "DRV_UNKNOWN")
-
-        event = generate_event(vin, driver_id)
-
-        producer.send(KAFKA_TOPIC, value=event)
-
-        print(f"Sent: {event}")
-
+        print(f"Sent batch of {BATCH_SIZE} events. Example: {batch_events[0]}")
         time.sleep(EVENT_DELAY)
 
 

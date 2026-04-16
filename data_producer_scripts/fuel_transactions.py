@@ -38,7 +38,7 @@ MAX_DISTANCE = FUEL_CONFIG["MAX_DISTANCE"]
 # ================================
 
 def load_vins():
-    vins = []
+    vin_model_map = {}
 
     if not os.path.exists(REGISTRY_FILE):
         raise FileNotFoundError(f"Registry file not found at: {REGISTRY_FILE}")
@@ -46,32 +46,51 @@ def load_vins():
     with open(REGISTRY_FILE, "r") as file:
         reader = csv.DictReader(file)
         for row in reader:
-            vins.append(row["vin"])
+            vin_model_map[row["vin"]] = row["model"]
 
-    print(f"Loaded {len(vins)} VINs")
-    return vins
+    print(f"Loaded {len(vin_model_map)} VINs")
+    return vin_model_map
 
 
 # ================================
 # GENERATE DATA
 # ================================
 
-def generate_data(vins):
+def generate_data(vin_model_map):
     data = []
     txn_counter = 1
 
     base_date = datetime(2026, 1, 1)
 
+    vins = list(vin_model_map.keys())
     odometer_map = {vin: random.randint(10000, 50000) for vin in vins}
+
+    BASELINE_KM_PER_LITER = {
+        "Freightliner M2": 5.0,
+        "Volvo VNL": 4.5,
+        "Isuzu N-Series": 6.0,
+        "Tata Ultra": 5.5,
+        "Ashok Leyland Dost": 8.0
+    }
 
     for _ in range(NUM_RECORDS):
 
         vin = random.choice(vins)
+        model = vin_model_map[vin]
+        baseline = BASELINE_KM_PER_LITER.get(model, 5.0)
 
         distance = random.randint(MIN_DISTANCE, MAX_DISTANCE)
         odometer_map[vin] += distance
 
-        fuel_liters = round(random.uniform(MIN_FUEL, MAX_FUEL), 2)
+        # 5% chance of fraudulent transaction (worse than baseline - 12%)
+        if random.random() < 0.05:
+            # Force efficiency worse than (baseline * 0.88), e.g., 15% worse
+            efficiency = baseline * 0.85
+        else:
+            # Normal efficiency, around baseline
+            efficiency = baseline * random.uniform(0.95, 1.05)
+
+        fuel_liters = round(distance / efficiency, 2)
 
         timestamp = base_date + timedelta(
             days=random.randint(0, 120),
@@ -154,13 +173,14 @@ def write_csv(data):
 if __name__ == "__main__":
 
     print("Loading VINs...")
-    vins = load_vins()
+    vin_model_map = load_vins()
+    vins_list = list(vin_model_map.keys())
 
     print("Generating fuel transactions...")
-    data = generate_data(vins)
+    data = generate_data(vin_model_map)
 
     print("Adding edge cases...")
-    data = add_edge_cases(data, vins)
+    data = add_edge_cases(data, vins_list)
 
     random.shuffle(data)
 
