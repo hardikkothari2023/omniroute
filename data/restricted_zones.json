@@ -1,59 +1,59 @@
 [
     {
-        "zone_name": "VIP Movement Zone",
-        "min_lat": 28.606462,
-        "max_lat": 28.658789,
-        "min_long": 77.061789,
-        "max_long": 77.117719
+        "zone_name": "Military Base Area",
+        "min_lat": 28.485437,
+        "max_lat": 28.544142,
+        "min_long": 77.270192,
+        "max_long": 77.32783
     },
     {
-        "zone_name": "Delhi Cantonment",
-        "min_lat": 28.502576,
-        "max_lat": 28.531329,
-        "min_long": 77.157519,
-        "max_long": 77.200196
-    },
-    {
-        "zone_name": "High Security Zone",
-        "min_lat": 28.551745,
-        "max_lat": 28.580068,
-        "min_long": 77.245748,
-        "max_long": 77.297213
+        "zone_name": "Military Base Area",
+        "min_lat": 28.725668,
+        "max_lat": 28.747824,
+        "min_long": 77.143733,
+        "max_long": 77.198025
     },
     {
         "zone_name": "Industrial Restricted Zone",
-        "min_lat": 28.731653,
-        "max_lat": 28.789254,
-        "min_long": 77.071203,
-        "max_long": 77.097434
+        "min_lat": 28.606791,
+        "max_lat": 28.658321,
+        "min_long": 77.030745,
+        "max_long": 77.074791
     },
     {
-        "zone_name": "High Security Zone",
-        "min_lat": 28.492777,
-        "max_lat": 28.552507,
-        "min_long": 77.361541,
-        "max_long": 77.418537
+        "zone_name": "Military Base Area",
+        "min_lat": 28.77392,
+        "max_lat": 28.805623,
+        "min_long": 77.327136,
+        "max_long": 77.378902
     },
     {
-        "zone_name": "Delhi Cantonment",
-        "min_lat": 28.726762,
-        "max_lat": 28.767825,
-        "min_long": 77.270656,
-        "max_long": 77.305067
+        "zone_name": "Warehouse Restricted Area",
+        "min_lat": 28.584762,
+        "max_lat": 28.641874,
+        "min_long": 77.230563,
+        "max_long": 77.261724
     },
     {
         "zone_name": "No Entry CP",
-        "min_lat": 28.753419,
-        "max_lat": 28.808001,
-        "min_long": 77.258364,
-        "max_long": 77.282794
+        "min_lat": 28.747913,
+        "max_lat": 28.793906,
+        "min_long": 77.009568,
+        "max_long": 77.036143
     },
     {
-        "zone_name": "IGI Airport Zone",
-        "min_lat": 28.721728,
-        "max_lat": 28.766698,
-        "min_long": 77.329943,
-        "max_long": 77.358857
+        "zone_name": "Industrial Restricted Zone",
+        "min_lat": 28.678978,
+        "max_lat": 28.70232,
+        "min_long": 77.001799,
+        "max_long": 77.027525
+    },
+    {
+        "zone_name": "No Entry CP",
+        "min_lat": 28.613613,
+        "max_lat": 28.636343,
+        "min_long": 77.083005,
+        "max_long": 77.126165
     },
     {
         "zone_name": "Overlap Zone",

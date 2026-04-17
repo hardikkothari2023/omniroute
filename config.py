@@ -114,7 +114,7 @@ ZONES_CONFIG = {
 TELEMETRY_CONFIG = {
     "KAFKA_TOPIC": "vehicle_telemetry_topic",
     "KAFKA_SERVER": "localhost:9092",
-    "EVENT_DELAY": 1,
+    "EVENT_DELAY": 3,
     "LAT_RANGE": (28.4, 28.9),
     "LONG_RANGE": (76.8, 77.5),
     "NORMAL_SPEED": (40, 100),
