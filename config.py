@@ -6,8 +6,6 @@ import sys
 # ================================
 
 BASE_DIR = os.path.dirname(__file__)
-
-# FIXED: config.py is already in root
 PROJECT_ROOT = BASE_DIR
 
 # ================================
@@ -15,11 +13,23 @@ PROJECT_ROOT = BASE_DIR
 # ================================
 
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ================================
-# FILE PATHS
+# RAW / PROCESSED DIRECTORIES
+# ================================
+
+RAW_DIR = os.path.join(DATA_DIR, "raw")
+PROCESSED_DIR = os.path.join(DATA_DIR, "processed")
+
+TELEMETRY_RAW_DIR = os.path.join(RAW_DIR, "telemetry")
+
+os.makedirs(RAW_DIR, exist_ok=True)
+os.makedirs(PROCESSED_DIR, exist_ok=True)
+os.makedirs(TELEMETRY_RAW_DIR, exist_ok=True)
+
+# ================================
+# FILE PATHS (CURRENT)
 # ================================
 
 VEHICLE_REGISTRY_FILE = os.path.join(DATA_DIR, "vehicle_registry.csv")
@@ -27,6 +37,16 @@ VEHICLE_ASSIGNMENT_FILE = os.path.join(DATA_DIR, "vehicle_assignment.csv")
 MAINTENANCE_FILE = os.path.join(DATA_DIR, "maintenance_schedules.csv")
 FUEL_FILE = os.path.join(DATA_DIR, "fuel_transactions.csv")
 RESTRICTED_ZONES_FILE = os.path.join(DATA_DIR, "restricted_zones.json")
+
+# ================================
+# RAW FILE PATHS (FUTURE SAFE)
+# ================================
+
+VEHICLE_REGISTRY_RAW_FILE = os.path.join(RAW_DIR, "vehicle_registry.csv")
+VEHICLE_ASSIGNMENT_RAW_FILE = os.path.join(RAW_DIR, "vehicle_assignment.csv")
+MAINTENANCE_RAW_FILE = os.path.join(RAW_DIR, "maintenance_schedules.csv")
+FUEL_RAW_FILE = os.path.join(RAW_DIR, "fuel_transactions.csv")
+RESTRICTED_ZONES_RAW_FILE = os.path.join(RAW_DIR, "restricted_zones.json")
 
 # ================================
 # SCRIPT PATHS
@@ -108,12 +128,14 @@ ZONES_CONFIG = {
 }
 
 # ================================
-# TELEMETRY CONFIG
+# TELEMETRY CONFIG (DYNAMIC KAFKA)
 # ================================
+
+KAFKA_SERVER = os.getenv("KAFKA_SERVER", "localhost:9092")
 
 TELEMETRY_CONFIG = {
     "KAFKA_TOPIC": "vehicle_telemetry_topic",
-    "KAFKA_SERVER": "localhost:9092",
+    "KAFKA_SERVER": KAFKA_SERVER,
     "EVENT_DELAY": 3,
     "LAT_RANGE": (28.4, 28.9),
     "LONG_RANGE": (76.8, 77.5),
@@ -121,6 +143,19 @@ TELEMETRY_CONFIG = {
     "HIGH_SPEED": (110, 130),
     "EXTREME_SPEED": (130, 160)
 }
+
+# ================================
+# OPTIONAL: SCHEMA CONTROL
+# ================================
+
+TELEMETRY_SCHEMA = [
+    "vin",
+    "driver_id",
+    "speed",
+    "lat",
+    "long",
+    "event_timestamp"
+]
 
 # ================================
 # PIPELINE CONTROL

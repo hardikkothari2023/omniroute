@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 from config import (
     VEHICLE_REGISTRY_FILE,
-    FUEL_FILE,
+    FUEL_RAW_FILE,
     FUEL_CONFIG,
     DATA_DIR
 )
@@ -25,7 +25,7 @@ from config import (
 os.makedirs(DATA_DIR, exist_ok=True)
 
 REGISTRY_FILE = VEHICLE_REGISTRY_FILE
-OUTPUT_FILE = FUEL_FILE
+OUTPUT_FILE = FUEL_RAW_FILE
 
 NUM_RECORDS = FUEL_CONFIG["NUM_RECORDS"]
 MIN_FUEL = FUEL_CONFIG["MIN_FUEL"]
@@ -82,12 +82,9 @@ def generate_data(vin_model_map):
         distance = random.randint(MIN_DISTANCE, MAX_DISTANCE)
         odometer_map[vin] += distance
 
-        # 5% chance of fraudulent transaction (worse than baseline - 12%)
         if random.random() < 0.05:
-            # Force efficiency worse than (baseline * 0.88), e.g., 15% worse
             efficiency = baseline * 0.85
         else:
-            # Normal efficiency, around baseline
             efficiency = baseline * random.uniform(0.95, 1.05)
 
         fuel_liters = round(distance / efficiency, 2)

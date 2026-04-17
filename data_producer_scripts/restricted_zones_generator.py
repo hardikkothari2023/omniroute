@@ -11,7 +11,7 @@ import json
 import random
 
 from config import (
-    RESTRICTED_ZONES_FILE,
+    RESTRICTED_ZONES_RAW_FILE,
     ZONES_CONFIG,
     DATA_DIR
 )
@@ -22,7 +22,7 @@ from config import (
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-OUTPUT_FILE = RESTRICTED_ZONES_FILE
+OUTPUT_FILE = RESTRICTED_ZONES_RAW_FILE
 
 NUM_ZONES = ZONES_CONFIG["NUM_ZONES"]
 LAT_RANGE = ZONES_CONFIG["LAT_RANGE"]

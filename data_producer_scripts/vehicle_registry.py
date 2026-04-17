@@ -13,7 +13,7 @@ import string
 from datetime import datetime
 
 from config import (
-    VEHICLE_REGISTRY_FILE,
+    VEHICLE_REGISTRY_RAW_FILE,
     VEHICLE_REGISTRY_CONFIG,
     DATA_DIR
 )
@@ -24,7 +24,7 @@ from config import (
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-OUTPUT_FILE = VEHICLE_REGISTRY_FILE
+OUTPUT_FILE = VEHICLE_REGISTRY_RAW_FILE
 
 NUM_RECORDS = VEHICLE_REGISTRY_CONFIG["NUM_RECORDS"]
 MODELS = VEHICLE_REGISTRY_CONFIG["MODELS"]
