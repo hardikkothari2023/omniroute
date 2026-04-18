@@ -1,0 +1,75 @@
+🧱 STEP 0: EC2 CONFIG
+Ubuntu 24
+t2.medium
+20 GB storage
+🚀 STEP 1: Connect & Update
+sudo apt update && sudo apt upgrade -y
+🚀 STEP 2: Install Java (Kafka)
+sudo apt install openjdk-11-jdk -y
+java -version
+
+✔ Java 11 / 17 / 21 → ALL OK
+
+🚀 STEP 3: Install SYSTEM DEPENDENCIES (for Python build)
+sudo apt install -y make build-essential libssl-dev zlib1g-dev \
+libbz2-dev libreadline-dev libsqlite3-dev curl llvm \
+libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev \
+libffi-dev liblzma-dev git
+🚀 STEP 4: Install PYTHON 3.10 (MANDATORY ⚠️)
+curl https://pyenv.run | bash
+echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.bashrc
+echo 'export PATH="$PYENV_ROOT/bin:$PATH"' >> ~/.bashrc
+echo 'eval "$(pyenv init --path)"' >> ~/.bashrc
+echo 'eval "$(pyenv init -)"' >> ~/.bashrc
+
+source ~/.bashrc
+pyenv install 3.10.14
+🚀 STEP 5: Clone Project
+git clone https://github.com/Saint-Potato/omniroute.git
+cd omniroute
+🚀 STEP 6: SET PYTHON VERSION (IMPORTANT)
+pyenv local 3.10.14
+python --version
+
+✔ Must show:
+
+Python 3.10.14
+🚀 STEP 7: Create Virtual Environment
+python -m venv venv
+source venv/bin/activate
+🚀 STEP 8: Install ONLY REQUIRED LIBS
+pip install --upgrade pip
+pip install kafka-python pandas numpy pyarrow
+
+❌ DO NOT:
+
+pip install -r requirements.txt
+🚀 STEP 9: Install Kafka (CORRECT LINK)
+cd ~
+
+wget https://archive.apache.org/dist/kafka/3.6.1/kafka_2.13-3.6.1.tgz
+tar -xvf kafka_2.13-3.6.1.tgz
+
+mv kafka_2.13-3.6.1 ~/omniroute/
+🚀 STEP 10: START KAFKA (2 TERMINALS)
+🟢 Terminal 1
+cd ~/omniroute/kafka_2.13-3.6.1
+bin/zookeeper-server-start.sh config/zookeeper.properties
+🟢 Terminal 2
+cd ~/omniroute/kafka_2.13-3.6.1
+bin/kafka-server-start.sh config/server.properties
+
+🚀 STEP 12: RUN PRODUCER
+cd ~/omniroute
+source venv/bin/activate
+
+python data_producer_scripts/run_all_producers.py
+
+👉 Enter:
+
+y
+🚀 STEP 13: RUN CONSUMER (NEW TERMINAL)
+cd ~/omniroute
+source venv/bin/activate
+
+python telemetry_consumer.py
