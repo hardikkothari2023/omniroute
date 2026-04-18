@@ -1,59 +1,59 @@
 [
     {
-        "zone_name": "Industrial Restricted Zone",
-        "min_lat": 28.608119,
-        "max_lat": 28.652501,
-        "min_long": 77.2736,
-        "max_long": 77.308258
+        "zone_name": "IGI Airport Zone",
+        "min_lat": 28.704691,
+        "max_lat": 28.74282,
+        "min_long": 77.217435,
+        "max_long": 77.238415
     },
     {
-        "zone_name": "Industrial Restricted Zone",
-        "min_lat": 28.496217,
-        "max_lat": 28.528032,
-        "min_long": 77.291972,
-        "max_long": 77.326725
-    },
-    {
-        "zone_name": "High Security Zone",
-        "min_lat": 28.678304,
-        "max_lat": 28.705906,
-        "min_long": 77.110447,
-        "max_long": 77.136744
-    },
-    {
-        "zone_name": "Industrial Restricted Zone",
-        "min_lat": 28.579819,
-        "max_lat": 28.61222,
-        "min_long": 77.074137,
-        "max_long": 77.100739
-    },
-    {
-        "zone_name": "High Security Zone",
-        "min_lat": 28.554788,
-        "max_lat": 28.591155,
-        "min_long": 77.099311,
-        "max_long": 77.126357
-    },
-    {
-        "zone_name": "Warehouse Restricted Area",
-        "min_lat": 28.540762,
-        "max_lat": 28.586671,
-        "min_long": 77.197196,
-        "max_long": 77.219872
+        "zone_name": "Delhi Cantonment",
+        "min_lat": 28.639303,
+        "max_lat": 28.692473,
+        "min_long": 77.246268,
+        "max_long": 77.289115
     },
     {
         "zone_name": "VIP Movement Zone",
-        "min_lat": 28.573484,
-        "max_lat": 28.616896,
-        "min_long": 77.262945,
-        "max_long": 77.302796
+        "min_lat": 28.616027,
+        "max_lat": 28.638305,
+        "min_long": 77.267765,
+        "max_long": 77.320231
+    },
+    {
+        "zone_name": "VIP Movement Zone",
+        "min_lat": 28.738615,
+        "max_lat": 28.76913,
+        "min_long": 77.167875,
+        "max_long": 77.223848
     },
     {
         "zone_name": "IGI Airport Zone",
-        "min_lat": 28.712947,
-        "max_lat": 28.760257,
-        "min_long": 77.384628,
-        "max_long": 77.414111
+        "min_lat": 28.587209,
+        "max_lat": 28.623397,
+        "min_long": 77.153708,
+        "max_long": 77.178891
+    },
+    {
+        "zone_name": "No Entry CP",
+        "min_lat": 28.680646,
+        "max_lat": 28.729517,
+        "min_long": 77.273789,
+        "max_long": 77.307148
+    },
+    {
+        "zone_name": "VIP Movement Zone",
+        "min_lat": 28.758737,
+        "max_lat": 28.803627,
+        "min_long": 77.04232,
+        "max_long": 77.082987
+    },
+    {
+        "zone_name": "Delhi Cantonment",
+        "min_lat": 28.695567,
+        "max_lat": 28.73105,
+        "min_long": 77.020057,
+        "max_long": 77.071813
     },
     {
         "zone_name": "Overlap Zone",

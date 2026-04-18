@@ -32,11 +32,11 @@ os.makedirs(TELEMETRY_RAW_DIR, exist_ok=True)
 # FILE PATHS (CURRENT)
 # ================================
 
-VEHICLE_REGISTRY_FILE = os.path.join(DATA_DIR, "vehicle_registry.csv")
-VEHICLE_ASSIGNMENT_FILE = os.path.join(DATA_DIR, "vehicle_assignment.csv")
-MAINTENANCE_FILE = os.path.join(DATA_DIR, "maintenance_schedules.csv")
-FUEL_FILE = os.path.join(DATA_DIR, "fuel_transactions.csv")
-RESTRICTED_ZONES_FILE = os.path.join(DATA_DIR, "restricted_zones.json")
+VEHICLE_REGISTRY_FILE = os.path.join(DATA_DIR, "raw/vehicle_registry.csv")
+VEHICLE_ASSIGNMENT_FILE = os.path.join(DATA_DIR, "raw/vehicle_assignment.csv")
+MAINTENANCE_FILE = os.path.join(DATA_DIR, "raw/maintenance_schedules.csv")
+FUEL_FILE = os.path.join(DATA_DIR, "raw/fuel_transactions.csv")
+RESTRICTED_ZONES_FILE = os.path.join(DATA_DIR, "raw/restricted_zones.json")
 
 # ================================
 # RAW FILE PATHS (FUTURE SAFE)
