@@ -52,7 +52,21 @@ def load_vins():
     return vins
 
 
-def load_active_assignments():
+_assignment_cache = {
+    "data": {},
+    "last_mtime": 0
+}
+
+def load_active_assignments(force_refresh=False):
+    global _assignment_cache
+
+    if not os.path.exists(ASSIGNMENT_FILE):
+        return {}
+
+    mtime = os.path.getmtime(ASSIGNMENT_FILE)
+    if not force_refresh and mtime <= _assignment_cache["last_mtime"]:
+        return _assignment_cache["data"]
+
     mapping = {}
     current_time = int(time.time())
 
@@ -63,6 +77,8 @@ def load_active_assignments():
             if end_ts == "" or (end_ts.isdigit() and int(end_ts) > current_time):
                 mapping[row["vin"]] = row["driver_id"]
 
+    _assignment_cache["data"] = mapping
+    _assignment_cache["last_mtime"] = mtime
     return mapping
 
 
@@ -109,7 +125,7 @@ def generate_event(vin, driver_id, zones):
         "speed": speed,
         "lat": lat,
         "long": long,
-        "event_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        "event_timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     }
 
     return event
@@ -131,28 +147,43 @@ def run_producer():
     print("Loading data...")
 
     vins = load_vins()
-    assignments = load_active_assignments()
+    assignments = load_active_assignments(force_refresh=True)
     zones = load_restricted_zones()
 
     print(f"Loaded {len(vins)} vehicles")
     print(f"Loaded {len(assignments)} active assignments")
     print(f"Loaded {len(zones)} restricted zones")
 
-    print("Starting telemetry stream in batches...\n")
+    print("Starting telemetry stream in batches... Press Ctrl+C to stop.\n")
     BATCH_SIZE = 50
+    last_cache_check = time.time()
 
-    while True:
-        batch_events = []
-        for _ in range(BATCH_SIZE):
-            vin = random.choice(vins)
-            driver_id = assignments.get(vin, "DRV_UNKNOWN")
+    try:
+        while True:
+            # Refresh assignments every 60 seconds
+            if time.time() - last_cache_check > 60:
+                assignments = load_active_assignments()
+                last_cache_check = time.time()
 
-            event = generate_event(vin, driver_id, zones)
-            producer.send(KAFKA_TOPIC, value=event)
-            batch_events.append(event)
+            batch_events = []
+            for _ in range(BATCH_SIZE):
+                vin = random.choice(vins)
+                driver_id = assignments.get(vin, "DRV_UNKNOWN")
 
-        print(f"Sent batch of {BATCH_SIZE} events. Example: {batch_events[0]}")
-        time.sleep(EVENT_DELAY)
+                event = generate_event(vin, driver_id, zones)
+                # Assign partition key to guarantee ordered processing downstream
+                producer.send(KAFKA_TOPIC, key=vin.encode("utf-8"), value=event)
+                batch_events.append(event)
+
+            print(f"Sent batch of {BATCH_SIZE} events. Example: {batch_events[0]}")
+            time.sleep(EVENT_DELAY)
+
+    except KeyboardInterrupt:
+        print("\nPipeline stopping gracefully. Flushing events to Kafka...")
+    finally:
+        producer.flush()
+        producer.close()
+        print("Kafka Producer closed safely.")
 
 
 # ================================

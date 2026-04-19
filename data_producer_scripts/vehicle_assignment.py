@@ -69,7 +69,9 @@ def generate_assignments(vins):
     data = []
     driver_counter = 1
 
-    base_date = datetime(2025, 1, 1)
+    # Dynamic base date: starting 6 months ago from today
+    now_utc = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    base_date = now_utc - timedelta(days=180)
 
     for vin in vins:
 
@@ -131,11 +133,13 @@ def add_edge_cases(data, vins):
         dup["daily_rate"] = 600
         data.append(dup)
 
+        now_utc = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+
         data.append({
             "vin": vins[1],
             "driver_id": "DRV_OVER1",
-            "start_timestamp": to_unix(datetime(2026, 4, 1)),
-            "end_timestamp": to_unix(datetime(2026, 4, 20)),
+            "start_timestamp": to_unix(now_utc - timedelta(days=20)),
+            "end_timestamp": to_unix(now_utc - timedelta(days=5)),
             "daily_rate": 500,
             "region": "North"
         })
@@ -143,7 +147,7 @@ def add_edge_cases(data, vins):
         data.append({
             "vin": vins[1],
             "driver_id": "DRV_OVER2",
-            "start_timestamp": to_unix(datetime(2026, 4, 10)),
+            "start_timestamp": to_unix(now_utc - timedelta(days=10)),
             "end_timestamp": "",
             "daily_rate": 550,
             "region": "North"
@@ -152,7 +156,7 @@ def add_edge_cases(data, vins):
         data.append({
             "vin": "INVALID123",
             "driver_id": "DRV_BAD",
-            "start_timestamp": to_unix(datetime(2026, 5, 1)),
+            "start_timestamp": to_unix(now_utc + timedelta(days=10)),
             "end_timestamp": "",
             "daily_rate": 500,
             "region": "South"
