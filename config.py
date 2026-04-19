@@ -66,7 +66,7 @@ PYTHON_EXEC = sys.executable
 # ================================
 
 VEHICLE_REGISTRY_CONFIG = {
-    "NUM_RECORDS": 250000,
+    "NUM_RECORDS": 23000,
     "MODELS": [
         "Freightliner M2",
         "Volvo VNL",
@@ -82,7 +82,7 @@ VEHICLE_REGISTRY_CONFIG = {
 # ================================
 
 VEHICLE_ASSIGNMENT_CONFIG = {
-    "NUM_ROWS": 20000,
+    "NUM_ROWS": 120000,
     "REGIONS": ["North", "South", "East", "West", "Central", "NCR", "Mumbai", "Jaipur"],
     "MIN_RATE": 300,
     "MAX_RATE": 1200
@@ -93,7 +93,7 @@ VEHICLE_ASSIGNMENT_CONFIG = {
 # ================================
 
 MAINTENANCE_CONFIG = {
-    "NUM_RECORDS": 5000,
+    "NUM_RECORDS": 9999,
     "SERVICE_TYPES": [
         "Engine Overhaul",
         "Tire Rotation",
@@ -109,7 +109,7 @@ MAINTENANCE_CONFIG = {
 # ================================
 
 FUEL_CONFIG = {
-    "NUM_RECORDS": 5000,
+    "NUM_RECORDS": 9999,
     "MIN_FUEL": 20,
     "MAX_FUEL": 150,
     "MIN_DISTANCE": 100,
@@ -158,10 +158,36 @@ TELEMETRY_SCHEMA = [
 ]
 
 # ================================
+# REPORTING DB (POSTGRESQL)
+# ================================
+
+POSTGRES_CONFIG = {
+    "HOST": os.getenv("DB_HOST", "localhost"),
+    "PORT": os.getenv("DB_PORT", "5432"),
+    "DATABASE": os.getenv("DB_NAME", "omniroute_db"),
+    "USER": os.getenv("DB_USER", "postgres"),
+    "PASSWORD": os.getenv("DB_PASSWORD", "postgres"),
+    "DRIVER_STATUS_TABLE": "driver_safety_status"
+}
+
+# ================================
 # PIPELINE CONTROL
 # ================================
 
 PIPELINE_CONFIG = {
     "RUN_TELEMETRY": True,
     "ENABLE_EDGE_CASES": True
+}
+
+# ================================
+# POSTGRES REPORTING EXPORT
+# ================================
+
+POSTGRES_CONFIG = {
+    "HOST": os.getenv("PG_HOST", "localhost"),
+    "PORT": os.getenv("PG_PORT", "5432"),
+    "DATABASE": os.getenv("PG_DB", "omniroute_dwh"),
+    "USER": os.getenv("PG_USER", "postgres"),
+    "PASSWORD": os.getenv("PG_PASSWORD", "postgres"),
+    "DRIVER_STATUS_TABLE": "gold.driver_safety_status"
 }
