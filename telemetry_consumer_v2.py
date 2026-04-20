@@ -146,7 +146,7 @@ def load_active_assignments(force_refresh=False):
     mtime = os.path.getmtime(VEHICLE_ASSIGNMENT_FILE)
     if not force_refresh and mtime <= _assignment_cache["last_mtime"]:
         return _assignment_cache["data"]
-
+ 
     mapping = {}
     current_time = int(time.time())
     

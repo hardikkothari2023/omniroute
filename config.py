@@ -66,7 +66,7 @@ PYTHON_EXEC = sys.executable
 # ================================
 
 VEHICLE_REGISTRY_CONFIG = {
-    "NUM_RECORDS": 23000,
+    "NUM_RECORDS": 3000,
     "MODELS": [
         "Freightliner M2",
         "Volvo VNL",
@@ -136,7 +136,7 @@ KAFKA_SERVER = os.getenv("KAFKA_SERVER", "localhost:9092")
 TELEMETRY_CONFIG = {
     "KAFKA_TOPIC": "vehicle_telemetry_topic",
     "KAFKA_SERVER": KAFKA_SERVER,
-    "EVENT_DELAY": 3,
+    "EVENT_DELAY": 1,
     "LAT_RANGE": (28.4, 28.9),
     "LONG_RANGE": (76.8, 77.5),
     "NORMAL_SPEED": (40, 100),
@@ -156,19 +156,6 @@ TELEMETRY_SCHEMA = [
     "long",
     "event_timestamp"
 ]
-
-# ================================
-# REPORTING DB (POSTGRESQL)
-# ================================
-
-POSTGRES_CONFIG = {
-    "HOST": os.getenv("DB_HOST", "localhost"),
-    "PORT": os.getenv("DB_PORT", "5432"),
-    "DATABASE": os.getenv("DB_NAME", "omniroute_db"),
-    "USER": os.getenv("DB_USER", "postgres"),
-    "PASSWORD": os.getenv("DB_PASSWORD", "postgres"),
-    "DRIVER_STATUS_TABLE": "driver_safety_status"
-}
 
 # ================================
 # PIPELINE CONTROL
