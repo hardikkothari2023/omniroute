@@ -8,7 +8,8 @@
         "landing": "s3://ttn-de-bootcamp-bronze-us-east-1/poc-bootcamp-group5-bronze/landing/",
         "ingested": "s3://ttn-de-bootcamp-bronze-us-east-1/poc-bootcamp-group5-bronze/ingested/",
         "quarantine": "s3://ttn-de-bootcamp-bronze-us-east-1/poc-bootcamp-group5-bronze/quarantine/",
-        "archive": "s3://ttn-de-bootcamp-bronze-us-east-1/poc-bootcamp-group5-bronze/archive/"
+        "archive": "s3://ttn-de-bootcamp-bronze-us-east-1/poc-bootcamp-group5-bronze/archive/",
+        "old_ref": "s3://ttn-de-bootcamp-bronze-us-east-1/poc-bootcamp-group5-bronze/old_ref/"
     },
     "silver": {
         "description": "Cleansed & enriched layer — Delta Lake tables with dedup, type-casting, and business rules",
@@ -32,25 +33,9 @@
         "description": "AWS Glue job configuration — referenced by Airflow DAGs",
         "jobs": {
             "bronze_ingest": {
-                "job_name": "bronze_ingestion_group5",
-                "script_location": "s3://ttn-de-bootcamp-bronze-us-east-1/poc-bootcamp-group5-bronze/glue-scripts/bronze_ingestion_group5.py",
-                "iam_role_name": "SSM-Role-TTN-Bootcamp-2026-Role",
-                "glue_version": "4.0",
-                "worker_type": "G.1X",
-                "number_of_workers": 2,
-                "timeout_minutes": 30,
-                "max_retries": 1,
-                "max_concurrent_runs": 1
-            }
-        }
-    },
-    "glue_yearly": {
-        "description": "AWS Glue job configuration — referenced by Airflow DAGs",
-        "jobs": {
-            "bronze_ingest": {
-                "job_name": "bronze_ingestion_group5_yearly",
-                "script_location": "s3://ttn-de-bootcamp-bronze-us-east-1/poc-bootcamp-group5-bronze/glue-scripts/bronze_ingestion_group5.py",
-                "iam_role_name": "SSM-Role-TTN-Bootcamp-2026-Role",
+                "job_name": "omniroute-daily-ingest-bronze",
+                "script_location": "s3://ttn-de-bootcamp-bronze-us-east-1/poc-bootcamp-group5-bronze/glue-scripts/daily_ingest_bronze_glue.py",
+                "iam_role_name": "omniroute-glue-role",
                 "glue_version": "4.0",
                 "worker_type": "G.1X",
                 "number_of_workers": 2,
