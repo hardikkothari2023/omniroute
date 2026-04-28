@@ -202,24 +202,29 @@ with DAG(
     # ──────────────────────────────────────────
     with TaskGroup("bronze") as bronze:
 
-        ingest_registry = BashOperator(
-            task_id="ingest_vehicle_registry",
+        ingest_bronze_layer = BashOperator(
+            task_id="ingest_bronze_layer",
             bash_command=spark_cmd(
                 "batch/daily_ingest_vehicle_registry.py",
                 f"--run-date {RUN_DATE}",
             ),
         )
 
-        ingest_assignment = BashOperator(
-            task_id="ingest_vehicle_assignment",
+    # ──────────────────────────────────────────
+    # SILVER — Cleanse, dedup, enrich
+    # ──────────────────────────────────────────
+    with TaskGroup("silver") as silver:
+
+        transform_assignment = BashOperator(
+            task_id="transform_vehicle_assignment",
             bash_command=spark_cmd(
                 "batch/daily_ingest_vehicle_assignment.py",
                 f"--run-date {RUN_DATE}",
             ),
         )
 
-        ingest_fuel = BashOperator(
-            task_id="ingest_fuel_transactions",
+        transform_fuel = BashOperator(
+            task_id="transform_fuel_transactions",
             bash_command=spark_cmd(
                 "batch/daily_ingest_fuel_transactions.py",
                 f"--run-date {RUN_DATE}",
@@ -335,4 +340,4 @@ with DAG(
     # # Gold → Reporting
     # [build_fuel_audit, build_fleet_snapshot] >> load_postgres
     # load_postgres >> generate_reports
-    pass
+

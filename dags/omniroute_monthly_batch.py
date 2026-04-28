@@ -37,7 +37,10 @@ default_args = {
 # ──────────────────────────────────────────────
 def spark_cmd(script: str, extra_args: str = "") -> str:
     """Build a spark-submit command string."""
-    return f"{SPARK_SUBMIT} {JOBS_DIR}/{script} {extra_args}".strip()
+    return (
+        f"export JAVA_HOME=$(dirname $(dirname $(readlink -f $(which java)))) && "
+        f"{SPARK_SUBMIT} {JOBS_DIR}/{script} {extra_args}"
+    ).strip()
 
 
 # ──────────────────────────────────────────────
