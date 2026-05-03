@@ -1,44 +1,35 @@
 """
-OmniRoute — Daily Bronze + Silver + Gold Pipeline DAG (Glue-based)
-====================================================================
-Schedule : Daily @ 05:00 UTC
-Pipeline : Bronze Ingestion → Silver Transformations → Gold Analytics → Reporting
+OmniRoute — Morning Fuel Pipeline DAG (DAG 2 of 2)
+=====================================================
+Schedule: Daily @ 07:00 UTC
+
+Runs ONLY after the midnight pipeline (DAG 1) completes successfully.
+Uses ExternalTaskSensor to wait for omniroute_midnight_pipeline.end.
+
+Handles:
+  - Bronze ingestion (fuel_transactions only)
+  - Silver fuel transactions
+  - Gold fuel efficiency audit
+  - Gold to PostgreSQL reporting
 
 DAG Dependency Graph:
 ═══════════════════════
-  start
+  wait_for_midnight_pipeline (ExternalTaskSensor)
     │
     ▼
-  trigger_glue_bronze_ingest
+  daily_bronze_fuel (fuel_transactions only)
     │
-    ├──────────────────────────┐
-    ▼                          ▼
-  silver_vehicle_registry    silver_maintenance_schedules
-    │                          │
-    ▼                          │
-  silver_vehicle_assignment    │
-    │                          │
-    ├──────────────────────────┘
     ▼
   silver_fuel_transactions
     │
-    ├──────────────────────────┐
-    ▼                          ▼
-  gold_fuel_efficiency_audit  gold_active_fleet_snapshot
-    │                          │
-    ├──────────────────────────┘
+    ▼
+  gold_fuel_efficiency_audit
+    │
     ▼
   gold_to_postgres
     │
     ▼
   end
-
-Key Design Decisions:
-  1. Bronze, Silver, Gold, and Reporting run in a SINGLE DAG to guarantee
-     correct execution order (no timing guesswork).
-  2. Gold fuel_efficiency_audit depends on all Silver tables completing.
-  3. Gold active_fleet_snapshot depends on Silver assignment + vehicle.
-  4. gold_to_postgres loads all Gold/Silver tables into PostgreSQL.
 """
 
 import json
@@ -49,6 +40,7 @@ from pathlib import Path
 from airflow.sdk import DAG
 from airflow.providers.standard.operators.empty import EmptyOperator
 from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
+from airflow.providers.standard.sensors.external_task import ExternalTaskSensor
 
 
 # ──────────────────────────────────────────────────────────────
@@ -78,13 +70,8 @@ GOLD_FLEET_SNAPSHOT_PATH = config["gold"]["tables"]["active_fleet_snapshot"]
 
 # ── Glue job configs ──
 GLUE_BRONZE = config["glue"]["jobs"]["bronze_ingest"]
-GLUE_SILVER_REGISTRY = config["glue"]["jobs"]["silver_vehicle_registry"]
-GLUE_SILVER_ASSIGNMENT = config["glue"]["jobs"]["silver_vehicle_assignment"]
 GLUE_SILVER_FUEL = config["glue"]["jobs"]["silver_fuel_transactions"]
-GLUE_SILVER_MAINTENANCE = config["glue"]["jobs"]["silver_maintenance_schedules"]
-
 GLUE_GOLD_FUEL_AUDIT = config["glue"]["jobs"]["gold_fuel_efficiency_audit"]
-GLUE_GOLD_FLEET_SNAPSHOT = config["glue"]["jobs"]["gold_active_fleet_snapshot"]
 GLUE_GOLD_TO_POSTGRES = config["glue"]["jobs"]["gold_to_postgres"]
 
 RUN_DATE = "{{ ds }}"
@@ -125,7 +112,7 @@ def build_glue_task(task_id, glue_config, script_args):
 
 
 # ──────────────────────────────────────────────────────────────
-# DAG Default Arguments
+# DAG Definition
 # ──────────────────────────────────────────────────────────────
 default_args = {
     "owner": "omniroute",
@@ -135,33 +122,50 @@ default_args = {
     "email_on_failure": False,
 }
 
-
-# ──────────────────────────────────────────────────────────────
-# DAG Definition
-# ──────────────────────────────────────────────────────────────
 with DAG(
-    dag_id="omniroute_daily_bronze_silver_gold_pipeline",
+    dag_id="omniroute_morning_fuel_pipeline",
     description=(
-        "Daily pipeline: Bronze CSV→Parquet → Silver Delta Lake (SCD1/SCD2) "
-        "→ Gold Analytics (Fuel Audit, Fleet Snapshot) → PostgreSQL Reporting"
+        "Morning pipeline: Waits for midnight pipeline success, then "
+        "Bronze (fuel) → Silver fuel → Gold fuel audit → PostgreSQL."
     ),
-    schedule="0 5 * * *",
-    start_date=datetime(2026, 4, 1),
+    schedule="0 7 * * *",              # Daily at 07:00 UTC
+    start_date=datetime(2026, 1, 1),
     catchup=False,
-    tags=["bronze", "silver", "gold", "glue", "delta", "daily", "pipeline"],
+    tags=["bronze", "silver", "gold", "glue", "delta", "daily", "fuel", "morning"],
     default_args=default_args,
     max_active_runs=1,
 ) as dag:
 
-    # ── Markers ──
-    start = EmptyOperator(task_id="start")
+    # ══════════════════════════════════════════════════════════
+    # GATE — Wait for midnight pipeline to complete
+    # ══════════════════════════════════════════════════════════
+    # ExternalTaskSensor waits for the "end" task of the midnight
+    # pipeline to succeed. Both DAGs share the same data_interval
+    # (same ds) since they run on the same calendar day.
+    #
+    # execution_date_fn maps this DAG's logical_date to the
+    # midnight DAG's logical_date. Since both run daily:
+    #   Morning DAG (07:00 UTC, May 3) → ds = 2026-05-03
+    #   Midnight DAG (00:00 UTC, May 3) → ds = 2026-05-03
+    # They share the same ds, so no date offset is needed.
+    wait_for_midnight = ExternalTaskSensor(
+        task_id="wait_for_midnight_pipeline",
+        external_dag_id="omniroute_midnight_pipeline",
+        external_task_id="end",
+        mode="reschedule",            # Release worker between checks
+        poke_interval=120,            # Check every 2 minutes
+        timeout=3600,                 # Fail after 1 hour of waiting
+        allowed_states=["success"],
+        failed_states=["failed", "upstream_failed"],
+    )
+
     end = EmptyOperator(task_id="end")
 
-    # ──────────────────────────────────────────
-    # BRONZE: Trigger Glue Bronze Ingestion
-    # ──────────────────────────────────────────
-    trigger_bronze = GlueJobOperator(
-        task_id="trigger_glue_bronze_ingest",
+    # ══════════════════════════════════════════════════════════
+    # BRONZE — Ingest fuel_transactions.csv only
+    # ══════════════════════════════════════════════════════════
+    daily_bronze_fuel = GlueJobOperator(
+        task_id="daily_bronze_fuel",
         job_name=GLUE_BRONZE["job_name"],
         iam_role_name=GLUE_BRONZE["iam_role_name"],
         script_location=GLUE_BRONZE["script_location"],
@@ -177,6 +181,7 @@ with DAG(
             "--ingested_path": BRONZE_INGESTED_PATH,
             "--quarantine_path": BRONZE_QUARANTINE_PATH,
             "--archive_path": BRONZE_ARCHIVE_PATH,
+            "--datasets": "fuel_transactions",
         },
         wait_for_completion=True,
         verbose=True,
@@ -185,36 +190,9 @@ with DAG(
         retry_delay=timedelta(minutes=3),
     )
 
-    # ──────────────────────────────────────────
-    # SILVER: Vehicle Registry → dim_vehicle
-    # ──────────────────────────────────────────
-    silver_registry = build_glue_task(
-        task_id="silver_vehicle_registry",
-        glue_config=GLUE_SILVER_REGISTRY,
-        script_args={
-            "--run_date": RUN_DATE,
-            "--bronze_ingested_path": BRONZE_INGESTED_PATH,
-            "--silver_output_path": SILVER_VEHICLE_REGISTRY_PATH,
-        },
-    )
-
-    # ──────────────────────────────────────────
-    # SILVER: Vehicle Assignment → dim_vehicle_assignment_scd2
-    # ──────────────────────────────────────────
-    silver_assignment = build_glue_task(
-        task_id="silver_vehicle_assignment",
-        glue_config=GLUE_SILVER_ASSIGNMENT,
-        script_args={
-            "--run_date": RUN_DATE,
-            "--bronze_ingested_path": BRONZE_INGESTED_PATH,
-            "--silver_output_path": SILVER_VEHICLE_ASSIGNMENT_PATH,
-            "--silver_vehicle_path": SILVER_VEHICLE_REGISTRY_PATH,
-        },
-    )
-
-    # ──────────────────────────────────────────
-    # SILVER: Fuel Transactions → fact_fuel
-    # ──────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
+    # SILVER — Fuel Transactions → fact_fuel
+    # ══════════════════════════════════════════════════════════
     silver_fuel = build_glue_task(
         task_id="silver_fuel_transactions",
         glue_config=GLUE_SILVER_FUEL,
@@ -228,10 +206,9 @@ with DAG(
         },
     )
 
-    # ──────────────────────────────────────────
-    # GOLD: Fuel Efficiency Audit (BRD 3.3.2)
-    # Flag vehicles >12% below baseline, exclude weekends + maintenance
-    # ──────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
+    # GOLD — Fuel Efficiency Audit
+    # ══════════════════════════════════════════════════════════
     gold_fuel_audit = build_glue_task(
         task_id="gold_fuel_efficiency_audit",
         glue_config=GLUE_GOLD_FUEL_AUDIT,
@@ -244,24 +221,9 @@ with DAG(
         },
     )
 
-    # ──────────────────────────────────────────
-    # GOLD: Active Fleet Snapshot (BRD 5.3.2)
-    # Daily count of IN-TRANSIT vehicles by model
-    # ──────────────────────────────────────────
-    gold_fleet_snapshot = build_glue_task(
-        task_id="gold_active_fleet_snapshot",
-        glue_config=GLUE_GOLD_FLEET_SNAPSHOT,
-        script_args={
-            "--run_date": RUN_DATE,
-            "--silver_assignment_path": SILVER_VEHICLE_ASSIGNMENT_PATH,
-            "--silver_vehicle_path": SILVER_VEHICLE_REGISTRY_PATH,
-            "--gold_output_path": GOLD_FLEET_SNAPSHOT_PATH,
-        },
-    )
-
-    # ──────────────────────────────────────────
-    # REPORTING: Load Gold → PostgreSQL (BRD 5.2)
-    # ──────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
+    # REPORTING — Gold → PostgreSQL
+    # ══════════════════════════════════════════════════════════
     gold_to_postgres = build_glue_task(
         task_id="gold_to_postgres",
         glue_config=GLUE_GOLD_TO_POSTGRES,
@@ -280,17 +242,7 @@ with DAG(
         },
     )
 
-    # ──────────────────────────────────────────
-    # Task Dependencies
-    # ──────────────────────────────────────────
-    # Bronze first, then Silver in correct ER order
-    start >> trigger_bronze
-    trigger_bronze >> [silver_registry]
-    silver_registry >> silver_assignment
-    [silver_assignment] >> silver_fuel
-    
-    # Gold analytics depend on Silver
-    silver_fuel >> [gold_fuel_audit, gold_fleet_snapshot]
-    
-    # Reporting depends on Gold
-    [gold_fuel_audit, gold_fleet_snapshot] >> gold_to_postgres >> end
+    # ══════════════════════════════════════════════════════════
+    # TASK DEPENDENCIES
+    # ══════════════════════════════════════════════════════════
+    wait_for_midnight >> daily_bronze_fuel >> silver_fuel >> gold_fuel_audit >> gold_to_postgres >> end
