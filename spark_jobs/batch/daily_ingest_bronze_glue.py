@@ -148,7 +148,8 @@ def move_s3_object(source_uri, target_uri):
 # ──────────────────────────────────────────────────────────────
 # Core Ingestion Logic
 # ──────────────────────────────────────────────────────────────
-def process_datasets(spark, run_date, landing_path, ingested_path, quarantine_path, archive_path):
+def process_datasets(spark, run_date, landing_path, ingested_path, quarantine_path, archive_path,
+                     datasets_filter=None):
     """
     Iterate over each CSV dataset, validate, enrich with metadata,
     and write as partitioned Parquet. Failed files go to quarantine.
@@ -160,13 +161,24 @@ def process_datasets(spark, run_date, landing_path, ingested_path, quarantine_pa
         ingested_path   : S3 path for validated Parquet output
         quarantine_path : S3 path for rejected / malformed files
         archive_path    : S3 path for archiving processed CSV files
+        datasets_filter : Optional list of dataset names to process
+                          (e.g., ["vehicle_registry", "vehicle_assignment"]).
+                          If None, all datasets are processed.
     """
-    # List of source CSV filenames to process in this job
-    files_to_process = [
+    # All possible source CSV filenames
+    all_files = [
         "fuel_transactions.csv",
         "vehicle_registry.csv",
         "vehicle_assignment.csv",
     ]
+
+    # Filter to requested datasets only (if specified)
+    if datasets_filter:
+        files_to_process = [f for f in all_files if f.replace(".csv", "") in datasets_filter]
+        print(f"[bronze] Processing filtered datasets: {[f.replace('.csv', '') for f in files_to_process]}")
+    else:
+        files_to_process = all_files
+        print(f"[bronze] Processing all datasets: {[f.replace('.csv', '') for f in files_to_process]}")
 
     for source_filename in files_to_process:
         # Build full S3 source path to the CSV file
@@ -192,19 +204,35 @@ def process_datasets(spark, run_date, landing_path, ingested_path, quarantine_pa
 
         try:
             # ── Read raw CSV with headers ──
-            # No explicit schema applied here so we can read the actual CSV columns, 
-            # allowing different column order.
+            # Read without schema enforcement so we can handle extra/missing columns.
             df = (
                 spark.read
                 .option("header", "true")
                 .csv(source)
             )
 
-            # ── Validate column names match expected schema (regardless of order) ──
-            validate_schema(df, [f.name for f in expected_schema.fields])
+            # ── Select ONLY columns defined in our schema ──
+            # - Extra columns in CSV → silently ignored
+            # - Missing columns in CSV → filled with NULL (Spark default)
+            actual_columns = set(df.columns)
+            expected_fields = expected_schema.fields
+            expected_names = {f.name for f in expected_fields}
 
-            # ── Select and cast columns in exact expected order ──
-            cast_cols = [col(f.name).cast(f.dataType).alias(f.name) for f in expected_schema.fields]
+            # Log any discrepancies
+            extra_cols = actual_columns - expected_names
+            missing_cols = expected_names - actual_columns
+            if extra_cols:
+                print(f"[{dataset_name}] ⚠ Ignoring extra CSV columns not in schema: {extra_cols}")
+            if missing_cols:
+                print(f"[{dataset_name}] ⚠ Missing CSV columns (will be NULL): {missing_cols}")
+
+            # Build select list: use column if present, else lit(None) with correct type
+            cast_cols = []
+            for f in expected_fields:
+                if f.name in actual_columns:
+                    cast_cols.append(col(f.name).cast(f.dataType).alias(f.name))
+                else:
+                    cast_cols.append(lit(None).cast(f.dataType).alias(f.name))
             df = df.select(*cast_cols)
 
             # ── Check for empty files ──
@@ -227,8 +255,10 @@ def process_datasets(spark, run_date, landing_path, ingested_path, quarantine_pa
             )
 
             # ── Write Parquet, partitioned by load_date ──
-            # mode="append" allows multiple runs for different dates
-            # to co-exist in the same dataset folder
+            # IMPORTANT: Dynamic partition overwrite ensures ONLY today's
+            # partition is replaced. Without this, Spark's default "static"
+            # mode would DELETE ALL existing partitions!
+            spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")  # this we need to see 
             df.write.mode("overwrite").partitionBy("load_date").parquet(dest)
             print(f"[{dataset_name}] ✓ Wrote {row_count} rows → {dest}/load_date={run_date}")
             
@@ -256,14 +286,21 @@ def process_datasets(spark, run_date, landing_path, ingested_path, quarantine_pa
 # Step 1: Parse Glue job parameters
 # getResolvedOptions reads --JOB_NAME plus any custom args passed
 # via the Airflow GlueJobOperator's script_args parameter.
-args = getResolvedOptions(sys.argv, [
+# Base required parameters
+base_params = [
     "JOB_NAME",          # Glue-managed: name of this job
     "run_date",          # Custom: partition date (YYYY-MM-DD)
     "landing_path",      # Custom: S3 landing zone path
     "ingested_path",     # Custom: S3 ingested zone path
     "quarantine_path",   # Custom: S3 quarantine zone path
     "archive_path",      # Custom: S3 archive zone path
-])
+]
+
+# Optional: --datasets (comma-separated list of datasets to process)
+if "--datasets" in sys.argv:
+    base_params.append("datasets")
+
+args = getResolvedOptions(sys.argv, base_params)
 
 # Step 2: Initialize Spark + Glue contexts
 # SparkContext is the low-level Spark entry point.
@@ -289,6 +326,11 @@ archive = normalize_s3_path(args["archive_path"])
 # Step 5: Set the run date — use provided date or default to today
 run_date = args.get("run_date", str(date.today()))
 
+# Step 5b: Parse optional --datasets filter
+datasets_filter = None
+if "datasets" in args:
+    datasets_filter = [d.strip() for d in args["datasets"].split(",")]
+
 print("=" * 60)
 print(f"  OmniRoute Bronze Ingestion — Glue Job")
 print(f"  Run Date   : {run_date}")
@@ -296,11 +338,16 @@ print(f"  Landing    : {landing}")
 print(f"  Ingested   : {ingested}")
 print(f"  Quarantine : {quarantine}")
 print(f"  Archive    : {archive}")
+if datasets_filter:
+    print(f"  Datasets   : {datasets_filter}")
+else:
+    print(f"  Datasets   : ALL")
 print("=" * 60)
 
 # Step 6: Execute the ingestion pipeline
 try:
-    process_datasets(spark, run_date, landing, ingested, quarantine, archive)
+    process_datasets(spark, run_date, landing, ingested, quarantine, archive,
+                     datasets_filter=datasets_filter)
     print("✓ All datasets ingested successfully.")
 except Exception as e:
     print(f"✗ Bronze ingestion failed: {e}")

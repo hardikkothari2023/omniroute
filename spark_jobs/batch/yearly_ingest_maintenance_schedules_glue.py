@@ -103,9 +103,24 @@ def process_maintenance_schedules(spark, run_date, landing_path, ingested_path, 
             .csv(source)
         )
 
-        validate_schema(df, [f.name for f in EXPECTED_SCHEMA.fields])
+        # ── Select ONLY columns defined in our schema ──
+        actual_columns = set(df.columns)
+        expected_fields = EXPECTED_SCHEMA.fields
+        expected_names = {f.name for f in expected_fields}
 
-        cast_cols = [col(f.name).cast(f.dataType).alias(f.name) for f in EXPECTED_SCHEMA.fields]
+        extra_cols = actual_columns - expected_names
+        missing_cols = expected_names - actual_columns
+        if extra_cols:
+            print(f"[{dataset_name}] ⚠ Ignoring extra CSV columns not in schema: {extra_cols}")
+        if missing_cols:
+            print(f"[{dataset_name}] ⚠ Missing CSV columns (will be NULL): {missing_cols}")
+
+        cast_cols = []
+        for f in expected_fields:
+            if f.name in actual_columns:
+                cast_cols.append(col(f.name).cast(f.dataType).alias(f.name))
+            else:
+                cast_cols.append(lit(None).cast(f.dataType).alias(f.name))
         df = df.select(*cast_cols)
 
         row_count = df.count()
@@ -120,6 +135,7 @@ def process_maintenance_schedules(spark, run_date, landing_path, ingested_path, 
               .withColumn("source_file_name", lit(SOURCE_FILENAME))
               .withColumn("batch_id", lit(batch_id)))
 
+        spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
         df.write.mode("overwrite").partitionBy("load_date").parquet(dest)
         print(f"[{dataset_name}] ✓ Wrote {row_count} rows → {dest}/load_date={run_date}")
         

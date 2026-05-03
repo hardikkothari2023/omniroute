@@ -16,17 +16,21 @@
         "base_prefix": "poc-bootcamp-group5-silver",
         "tables": {
             "fuel_transactions": "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-group5-silver/silver.fuel_transactions/",
-            "maintenance_schedules": "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-group5-silver/silver.maintenance_schedules/",
+            "dim_maintenance": "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-group5-silver/silver.dim_maintenance/",
+            "dim_date": "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-group5-silver/silver.dim_date/",
             "telemetry": "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-group5-silver/silver.telemetry/",
             "vehicle_assignment": "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-group5-silver/silver.vehicle_assignment/",
             "vehicle_registry": "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-group5-silver/silver.vehicle_registry/"
         }
     },
     "gold": {
-        "description": "Business-level aggregates — SCD2, fuel audit, fleet snapshots (TODO: add paths when Gold layer is implemented)",
+        "description": "Business-level aggregates — fuel efficiency audit, active fleet snapshot",
         "base_bucket": "s3://ttn-de-bootcamp-gold-us-east-1",
         "base_prefix": "poc-bootcamp-group5-gold",
-        "tables": {}
+        "tables": {
+            "fuel_efficiency_audit": "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-group5-gold/gold.fuel_efficiency_audit/",
+            "active_fleet_snapshot": "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-group5-gold/gold.active_fleet_snapshot/"
+        }
     },
     "glue": {
         "description": "AWS Glue job configuration — referenced by Airflow DAGs",
@@ -85,11 +89,44 @@
                 "timeout_minutes": 30,
                 "max_retries": 1,
                 "max_concurrent_runs": 1
+            },
+            "gold_fuel_efficiency_audit": {
+                "job_name": "gold_fuel_efficiency_audit_group5",
+                "script_location": "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-group5-gold/glue-scripts/gold_fuel_efficiency_audit_glue.py",
+                "iam_role_name": "SSM-Role-TTN-Bootcamp-2026-Role",
+                "glue_version": "4.0",
+                "worker_type": "G.1X",
+                "number_of_workers": 2,
+                "timeout_minutes": 30,
+                "max_retries": 1,
+                "max_concurrent_runs": 1
+            },
+            "gold_active_fleet_snapshot": {
+                "job_name": "gold_active_fleet_snapshot_group5",
+                "script_location": "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-group5-gold/glue-scripts/gold_active_fleet_snapshot_glue.py",
+                "iam_role_name": "SSM-Role-TTN-Bootcamp-2026-Role",
+                "glue_version": "4.0",
+                "worker_type": "G.1X",
+                "number_of_workers": 2,
+                "timeout_minutes": 30,
+                "max_retries": 1,
+                "max_concurrent_runs": 1
+            },
+            "gold_to_postgres": {
+                "job_name": "gold_to_postgres_group5",
+                "script_location": "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-group5-gold/glue-scripts/gold_to_postgres_glue.py",
+                "iam_role_name": "SSM-Role-TTN-Bootcamp-2026-Role",
+                "glue_version": "4.0",
+                "worker_type": "G.1X",
+                "number_of_workers": 2,
+                "timeout_minutes": 30,
+                "max_retries": 1,
+                "max_concurrent_runs": 1
             }
         }
     },
     "glue_yearly": {
-        "description": "AWS Glue job configuration — referenced by Airflow DAGs",
+        "description": "AWS Glue job configuration — yearly jobs referenced by Airflow DAGs",
         "jobs": {
             "bronze_ingest": {
                 "job_name": "bronze_ingestion_group5_yearly",
@@ -99,6 +136,17 @@
                 "worker_type": "G.1X",
                 "number_of_workers": 2,
                 "timeout_minutes": 30,
+                "max_retries": 1,
+                "max_concurrent_runs": 1
+            },
+            "dim_date": {
+                "job_name": "silver_dim_date_group5",
+                "script_location": "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-group5-silver/glue-scripts/transform_dim_date_glue.py",
+                "iam_role_name": "SSM-Role-TTN-Bootcamp-2026-Role",
+                "glue_version": "4.0",
+                "worker_type": "G.1X",
+                "number_of_workers": 2,
+                "timeout_minutes": 15,
                 "max_retries": 1,
                 "max_concurrent_runs": 1
             }
