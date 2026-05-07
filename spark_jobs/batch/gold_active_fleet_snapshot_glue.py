@@ -142,8 +142,7 @@ def run(spark, run_date, silver_assignment_path, silver_vehicle_path, gold_outpu
         print(f"[active_fleet_snapshot] ✓ MERGE complete. Total Gold rows: {total}")
 
         # VACUUM
-        spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")
-        DeltaTable.forPath(spark, gold_output_path).vacuum(0)
+        DeltaTable.forPath(spark, gold_output_path).vacuum()
         print("[active_fleet_snapshot] ✓ VACUUM complete.")
     else:
         print("[active_fleet_snapshot] Gold does NOT exist → Bootstrap")

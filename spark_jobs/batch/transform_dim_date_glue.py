@@ -137,8 +137,7 @@ def run(spark, target_year, silver_path):
         print(f"[dim_date] ✓ MERGE complete. Total Silver rows: {final_count}")
 
         # ── VACUUM: Clean up old Parquet files ──
-        spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")
-        DeltaTable.forPath(spark, silver_path).vacuum(0)
+        DeltaTable.forPath(spark, silver_path).vacuum()
         print("[dim_date] ✓ VACUUM complete — old Parquet files deleted.")
 
     else:

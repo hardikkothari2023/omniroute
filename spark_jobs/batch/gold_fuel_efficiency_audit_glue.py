@@ -76,10 +76,16 @@ def run(spark, run_date, silver_fuel_path, silver_vehicle_path,
     print(f"[fuel_efficiency_audit] run_date={run_date}")
 
     # ── Step 1: Read Silver fact_fuel (only today's transactions) ──
+    # Silver layer saves transactions with txn_date = run_date - 1
+    # So we must audit target_date = run_date - 1
+    from datetime import timedelta as td
+    target_date = str(date.fromisoformat(run_date) - td(days=1))
+    print(f"[fuel_efficiency_audit] Target audit date: {target_date}")
+
     try:
         fuel_df = (
             spark.read.format("delta").load(silver_fuel_path)
-            .filter(col("txn_date") == lit(run_date))
+            .filter(col("txn_date") == lit(target_date))
         )
     except Exception as e:
         print(f"[fuel_efficiency_audit] ⚠ Could not read fact_fuel: {e}")
@@ -139,8 +145,8 @@ def run(spark, run_date, silver_fuel_path, silver_vehicle_path,
         col("odometer_reading_km") - col("prev_odometer")
     )
 
-    # Filter to only today's transactions (after distance calculation)
-    today_fuel = all_fuel.filter(col("txn_date") == lit(run_date))
+    # Filter to only the target day's transactions (after distance calculation)
+    today_fuel = all_fuel.filter(col("txn_date") == lit(target_date))
 
     # Join back with fuel_df to retain is_maintenance_day filter
     # Use transaction_timestamp as the join key from the filtered set
@@ -172,10 +178,19 @@ def run(spark, run_date, silver_fuel_path, silver_vehicle_path,
         print("[fuel_efficiency_audit] ⚠ No valid distance data. Skipping.")
         return
 
-    # ── Step 5: Calculate km_per_liter ──
+    # ── Step 5: Aggregate Daily Distance and Calculate km_per_liter ──
+    from pyspark.sql.functions import sum as _sum
+
+    # A vehicle might refuel multiple times a day. We must aggregate by VIN and date
+    # so we don't violate Postgres PRIMARY KEY (vin, audit_date) unique constraints.
+    today_with_distance = today_with_distance.groupBy("vin", "txn_date").agg(
+        _sum("distance_km").alias("daily_distance_km"),
+        _sum("fuel_liters").alias("daily_fuel_liters")
+    )
+
     today_with_distance = today_with_distance.withColumn(
         "km_per_liter",
-        (col("distance_km") / col("fuel_liters")).cast(FloatType())
+        (col("daily_distance_km") / col("daily_fuel_liters")).cast(FloatType())
     )
 
     # ── Step 6: JOIN dim_vehicle for baseline + model ──
@@ -255,8 +270,7 @@ def run(spark, run_date, silver_fuel_path, silver_vehicle_path,
         print(f"[fuel_efficiency_audit] ✓ MERGE complete. Total Gold rows: {total}")
 
         # VACUUM
-        spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")
-        DeltaTable.forPath(spark, gold_output_path).vacuum(0)
+        DeltaTable.forPath(spark, gold_output_path).vacuum()
         print("[fuel_efficiency_audit] ✓ VACUUM complete.")
     else:
         print("[fuel_efficiency_audit] Gold does NOT exist → Bootstrap")

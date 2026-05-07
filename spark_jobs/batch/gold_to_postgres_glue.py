@@ -55,6 +55,29 @@ def write_to_postgres(df, table_name, jdbc_url, connection_props, mode="overwrit
         print(f"  ✓ {table_name}: {row_count} rows → PostgreSQL ({mode})")
     except Exception as e:
         print(f"  ✗ {table_name}: FAILED — {e}")
+        raise # Fail the Glue Job if database connection fails
+
+
+def execute_postgres_query(spark, jdbc_url, query, user, password):
+    """Execute a raw SQL query against PostgreSQL using Py4J to enforce idempotency."""
+    try:
+        sc = spark.sparkContext
+        driver_manager = sc._gateway.jvm.java.sql.DriverManager
+        
+        # Add sslmode=require for raw JDBC connection
+        props = sc._gateway.jvm.java.util.Properties()
+        props.setProperty("user", user)
+        props.setProperty("password", password)
+        props.setProperty("sslmode", "require")
+        
+        connection = driver_manager.getConnection(jdbc_url, props)
+        statement = connection.createStatement()
+        statement.executeUpdate(query)
+        connection.close()
+        print(f"  ✓ Pre-Action: Executed '{query}'")
+    except Exception as e:
+        print(f"  ⚠ Pre-Action Failed ({query}): {e}")
+        raise # Fail the Glue Job if database connection fails
 
 
 def read_delta_safe(spark, path, label):
@@ -88,11 +111,18 @@ def run(spark, run_date, paths, jdbc_url, connection_props):
         assignment_df = assignment_df.select(*[col(c) for c in pg_cols if c in assignment_df.columns])
         write_to_postgres(assignment_df, "report.fleet_assignment_history", jdbc_url, connection_props, "overwrite")
 
-    # ── 2. Fuel Efficiency Audit (today's rows only) ──
+    # ── 2. Fuel Efficiency Audit (yesterday's rows only, based on run_date) ──
     print("\n[2/5] Loading fuel_efficiency_audit...")
     fuel_audit_df = read_delta_safe(spark, paths["fuel_audit"], "fuel_efficiency_audit")
     if fuel_audit_df is not None:
-        today_audit = fuel_audit_df.filter(col("audit_date") == lit(run_date))
+        from datetime import timedelta as td
+        target_date = str(date.fromisoformat(run_date) - td(days=1))
+        today_audit = fuel_audit_df.filter(col("audit_date") == lit(target_date))
+        
+        # Idempotency: Delete before append
+        delete_sql = f"DELETE FROM report.fuel_efficiency_audit WHERE audit_date = '{target_date}';"
+        execute_postgres_query(spark, jdbc_url, delete_sql, connection_props["user"], connection_props["password"])
+        
         write_to_postgres(today_audit, "report.fuel_efficiency_audit", jdbc_url, connection_props, "append")
 
     # ── 3. Active Fleet Snapshot (today's row only) ──
@@ -100,6 +130,11 @@ def run(spark, run_date, paths, jdbc_url, connection_props):
     snapshot_df = read_delta_safe(spark, paths["fleet_snapshot"], "active_fleet_snapshot")
     if snapshot_df is not None:
         today_snapshot = snapshot_df.filter(col("snapshot_date") == lit(run_date))
+        
+        # Idempotency: Delete before append
+        delete_sql = f"DELETE FROM report.active_fleet_snapshot WHERE snapshot_date = '{run_date}';"
+        execute_postgres_query(spark, jdbc_url, delete_sql, connection_props["user"], connection_props["password"])
+        
         write_to_postgres(today_snapshot, "report.active_fleet_snapshot", jdbc_url, connection_props, "append")
 
     # ── 4. Dim Vehicle (full replace) ──
@@ -154,6 +189,7 @@ connection_props = {
     "user": args["pg_user"],
     "password": args["pg_password"],
     "driver": "org.postgresql.Driver",
+    "sslmode": "require",
 }
 
 paths = {

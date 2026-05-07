@@ -9,13 +9,18 @@ cleans it, validates service_type against known list, and MERGEs into
 the Silver Delta table.
 
 Null Handling (Silver enforcement):
-  - vin NULL/empty      → DROP ROW (FK)
-  - service_date NULL   → DROP ROW (can't match to fuel dates)
+  - vin NULL/empty      → QUARANTINE ROW (FK)
+  - service_date NULL   → QUARANTINE ROW (can't match to fuel dates)
   - service_type NULL   → Default 'UNKNOWN'
 
 Service Type Fraud Validation:
   - service_type is validated against VALID_SERVICE_TYPES whitelist.
   - If not in list → flagged as 'UNVERIFIED' (row kept, but marked).
+
+Quarantine:
+  - Rejected rows appended to bronze quarantine/{table_name}/ as Parquet
+  - Bronze metadata (load_date, batch_id, etc.) preserved on quarantined rows
+  - batch_id used for idempotency — re-runs skip if batch already quarantined
 
 Bronze data is NOT moved — stays in ingested/ for auditability.
 
@@ -51,8 +56,6 @@ from delta.tables import DeltaTable
 # ──────────────────────────────────────────────────────────────
 TABLE_NAME = "maintenance_schedules"
 
-# Whitelist of valid service types for fraud validation.
-# Any service_type NOT in this list is flagged as 'UNVERIFIED'.
 VALID_SERVICE_TYPES = {
     "OIL_CHANGE", "TIRE_ROTATION", "BRAKE_INSPECTION", "BRAKE_REPLACEMENT",
     "ENGINE_TUNE_UP", "TRANSMISSION_SERVICE", "BATTERY_REPLACEMENT",
@@ -79,39 +82,110 @@ def silver_table_exists(spark, path):
         return False
 
 
+def derive_quarantine_path(bronze_ingested_path):
+    """Derive quarantine base from bronze ingested path.
+    e.g. s3://bucket/prefix/ingested/ → s3://bucket/prefix/quarantine/
+    """
+    return bronze_ingested_path.replace("/ingested/", "/quarantine/")
+
+
+# ──────────────────────────────────────────────────────────────
+# Quarantine Helpers
+# ──────────────────────────────────────────────────────────────
+def _tag_rejected(df, reason):
+    """Tag rejected rows with reason. Preserves all columns including
+    bronze metadata (load_date, batch_id, ingestion_timestamp, source_file_name).
+    """
+    return (
+        df.select([col(c).cast("string").alias(c) for c in df.columns])
+        .withColumn("rejection_reason", lit(reason))
+        .withColumn("rejected_at", current_timestamp())
+    )
+
+
+def write_quarantine(spark, quarantine_dfs, quarantine_base, table_name):
+    """Union all quarantine DFs and append to quarantine path.
+    Uses batch_id from bronze metadata for idempotency.
+    """
+    if not quarantine_dfs:
+        print(f"[{table_name}] ✓ No rows quarantined")
+        return
+
+    combined = quarantine_dfs[0]
+    for qdf in quarantine_dfs[1:]:
+        combined = combined.unionByName(qdf, allowMissingColumns=True)
+
+    count = combined.count()
+    if count == 0:
+        print(f"[{table_name}] ✓ No rows quarantined")
+        return
+
+    output_path = f"{quarantine_base}{table_name}"
+
+    # ── Idempotency: skip if batch_id already in quarantine ──
+    if "batch_id" in combined.columns:
+        batch_ids = [
+            r["batch_id"] for r in
+            combined.select("batch_id").distinct().collect()
+            if r["batch_id"] is not None
+        ]
+        if batch_ids:
+            try:
+                existing = spark.read.parquet(output_path)
+                already = existing.filter(
+                    col("batch_id").isin(batch_ids)
+                ).select("batch_id").distinct().count()
+                if already > 0:
+                    print(f"[{table_name}] ⚠ batch_id already in quarantine — skipping (idempotent)")
+                    return
+            except Exception:
+                pass  # Quarantine doesn't exist yet
+
+    combined.write.mode("append").parquet(output_path)
+    print(f"[{table_name}] ✗ Quarantined {count} rejected rows → {output_path}")
+
+
 # ──────────────────────────────────────────────────────────────
 # Data Cleaning
 # ──────────────────────────────────────────────────────────────
 def clean_snapshot(bronze_df):
     """
     Clean incoming Bronze maintenance schedules data.
-    Enforces null handling, dedup, service type validation, and ER schema.
+    Returns (clean_df, quarantine_dfs).
     """
+    quarantine_dfs = []
+
     # ── Parse service_date string → Date type ──
     df = bronze_df.withColumn(
         "service_date", to_date(col("service_date"), "yyyy-MM-dd")
     )
 
-    # ── Drop NULL/unparseable service_date ──
-    before_date = bronze_df.count()
+    # ── Quarantine NULL/unparseable service_date ──
+    rejected_date = df.filter(col("service_date").isNull())
     df = df.filter(col("service_date").isNotNull())
-    dropped_date = before_date - df.count()
+    dropped_date = rejected_date.count()
     if dropped_date > 0:
-        print(f"[dim_maintenance] Dropped {dropped_date} rows with NULL/invalid service_date")
+        print(f"[dim_maintenance] Rejected {dropped_date} rows: NULL/invalid service_date")
+        quarantine_dfs.append(_tag_rejected(rejected_date, "NULL_OR_INVALID_SERVICE_DATE"))
 
-    # ── Drop NULL/empty/INVALID VINs ──
-    before_vin = df.count()
-    df = df.filter(
-        col("vin").isNotNull()
-        & (col("vin") != "")
-    )
+    # ── Quarantine NULL/empty VINs ──
+    rejected_null_vin = df.filter(col("vin").isNull() | (col("vin") == ""))
+    df = df.filter(col("vin").isNotNull() & (col("vin") != ""))
+    null_vin_count = rejected_null_vin.count()
+    if null_vin_count > 0:
+        print(f"[dim_maintenance] Rejected {null_vin_count} rows: NULL/empty VIN")
+        quarantine_dfs.append(_tag_rejected(rejected_null_vin, "NULL_OR_EMPTY_VIN"))
+
     # ── Normalize VIN → UPPERCASE ──
     df = df.withColumn("vin", trim(upper(col("vin"))))
-    # ── Filter out INVALID_ prefixed VINs (already uppercased) ──
+
+    # ── Quarantine INVALID_ prefixed VINs ──
+    rejected_invalid_vin = df.filter(col("vin").startswith("INVALID_"))
     df = df.filter(~col("vin").startswith("INVALID_"))
-    dropped_vin = before_vin - df.count()
-    if dropped_vin > 0:
-        print(f"[dim_maintenance] Dropped {dropped_vin} rows with NULL/INVALID VIN")
+    invalid_vin_count = rejected_invalid_vin.count()
+    if invalid_vin_count > 0:
+        print(f"[dim_maintenance] Rejected {invalid_vin_count} rows: INVALID_ VIN prefix")
+        quarantine_dfs.append(_tag_rejected(rejected_invalid_vin, "INVALID_VIN_PREFIX"))
 
     # ── Dedup by (vin, service_date) ──
     dedup_window = Window.partitionBy("vin", "service_date").orderBy(col("service_type"))
@@ -129,9 +203,6 @@ def clean_snapshot(bronze_df):
     )
 
     # ── Service type fraud validation ──
-    # If service_type is not in the known whitelist, flag as 'UNVERIFIED'.
-    # Row is KEPT but marked, allowing downstream analysis to filter or audit.
-    before_validation = df.count()
     unverified_count = df.filter(~col("service_type").isin(list(VALID_SERVICE_TYPES))).count()
     if unverified_count > 0:
         print(f"[dim_maintenance] ⚠ {unverified_count} rows have unrecognized service_type → flagged as UNVERIFIED")
@@ -141,7 +212,7 @@ def clean_snapshot(bronze_df):
         .otherwise(lit("UNVERIFIED"))
     )
 
-    # ── Build final Silver schema (no audit_run_id) ──
+    # ── Build final Silver schema ──
     df = df.select(
         sha2(concat_ws("|", col("vin"), col("service_date").cast("string")), 256)
             .alias("maintenance_sk"),
@@ -154,17 +225,14 @@ def clean_snapshot(bronze_df):
         current_timestamp().alias("created_at"),
     )
 
-    return df
+    return df, quarantine_dfs
 
 
 # ──────────────────────────────────────────────────────────────
 # Core Transformation Logic
 # ──────────────────────────────────────────────────────────────
 def run(spark, run_date, bronze_base, silver_path):
-    """
-    Silver transformation for maintenance_schedules → dim_maintenance.
-    Reads only today's Bronze partition. Bronze data stays in place.
-    """
+    """Silver transformation for maintenance_schedules → dim_maintenance."""
     bronze_partition_path = f"{bronze_base}{TABLE_NAME}/load_date={run_date}"
     print(f"[dim_maintenance] run_date={run_date}")
     print(f"[dim_maintenance] Reading Bronze from: {bronze_partition_path}")
@@ -181,7 +249,12 @@ def run(spark, run_date, bronze_base, silver_path):
         print("[dim_maintenance] ⚠ No data. Skipping.")
         return
 
-    incoming_df = clean_snapshot(bronze_df)
+    incoming_df, quarantine_dfs = clean_snapshot(bronze_df)
+
+    # ── Write quarantined rows to bronze quarantine ──
+    quarantine_base = derive_quarantine_path(bronze_base)
+    write_quarantine(spark, quarantine_dfs, quarantine_base, TABLE_NAME)
+
     count = incoming_df.count()
     print(f"[dim_maintenance] After cleaning: {count} rows")
     if count == 0:
@@ -189,7 +262,6 @@ def run(spark, run_date, bronze_base, silver_path):
         return
 
     if silver_table_exists(spark, silver_path):
-        # ── SCD TYPE 1 MERGE ──
         print("[dim_maintenance] Silver exists → Delta MERGE (SCD1)")
         silver_table = DeltaTable.forPath(spark, silver_path)
 
@@ -201,26 +273,28 @@ def run(spark, run_date, bronze_base, silver_path):
             )
             .whenMatchedUpdate(
                 condition="existing.service_type != incoming.service_type",
-                set={
-                    "service_type": "incoming.service_type",
-                }
+                set={"service_type": "incoming.service_type"}
             )
-            .whenNotMatchedInsertAll()
+            .whenNotMatchedInsert(values={
+                "maintenance_sk": "incoming.maintenance_sk",
+                "vehicle_sk":     "incoming.vehicle_sk",
+                "date_id":        "incoming.date_id",
+                "vin":            "incoming.vin",
+                "service_date":   "incoming.service_date",
+                "service_type":   "incoming.service_type",
+                "description":    "incoming.description",
+                "created_at":     "incoming.created_at",
+            })
             .execute()
         )
 
         final_count = spark.read.format("delta").load(silver_path).count()
         print(f"[dim_maintenance] ✓ MERGE complete. Total Silver rows: {final_count}")
 
-        # ── VACUUM: Delete old Parquet files no longer in Delta log ──
-        # After SCD1 MERGE, old Parquet files are no longer needed.
-        # VACUUM(0) keeps only the latest version to save S3 storage.
-        spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")
-        DeltaTable.forPath(spark, silver_path).vacuum(0)
+        DeltaTable.forPath(spark, silver_path).vacuum()
         print("[dim_maintenance] ✓ VACUUM complete — old Parquet files deleted.")
 
     else:
-        # ── FIRST RUN (Bootstrap) ──
         print("[dim_maintenance] Silver does NOT exist → Bootstrap write")
         (
             incoming_df.write.format("delta")
@@ -240,7 +314,6 @@ args = getResolvedOptions(sys.argv, [
     "silver_output_path",
 ])
 
-# ── Delta Lake requires extensions set BEFORE SparkSession creation ──
 conf = SparkConf()
 conf.set("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
 conf.set("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")

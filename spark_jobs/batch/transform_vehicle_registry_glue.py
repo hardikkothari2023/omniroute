@@ -8,12 +8,17 @@ Reads ONLY today's partition from Bronze (partition pruning on load_date),
 cleans it, and MERGEs into the Silver Delta table.
 
 Null Handling (Silver enforcement):
-  - vin NULL/empty         → DROP ROW (PK)
-  - model NULL/empty       → DROP ROW (needed for baseline derivation)
-  - mfg_year NULL          → Default 0
-  - fuel_type NULL         → Left as NULL (dropped by valid fuel list filter)
+  - vin NULL/empty         → QUARANTINE ROW (PK)
+  - model NULL/empty       → QUARANTINE ROW (needed for baseline derivation)
+  - mfg_year NULL/0/out-of-range → QUARANTINE ROW (must be 2000–current year)
+  - fuel_type NULL         → Left as NULL (quarantined by valid fuel list filter)
   - baseline_kmpl NULL     → Derived from model avg (past Silver + current batch).
-                             If model has no baseline anywhere → DROP ROW.
+                             If model has no baseline anywhere → QUARANTINE ROW.
+
+Quarantine:
+  - Rejected rows appended to bronze quarantine/{table_name}/ as Parquet
+  - Bronze metadata (load_date, batch_id, etc.) preserved on quarantined rows
+  - batch_id used for idempotency — re-runs skip if batch already quarantined
 
 Bronze data is NOT moved — stays in ingested/ for auditability.
 
@@ -46,7 +51,7 @@ TABLE_NAME = "vehicle_registry"
 VALID_FUEL_TYPES = {"DIESEL", "LNG", "CNG", "ELECTRIC"}
 CURRENT_YEAR = datetime.utcnow().year
 MIN_MFG_YEAR = 2000
-MAX_MFG_YEAR = CURRENT_YEAR + 1
+MAX_MFG_YEAR = CURRENT_YEAR
 
 
 # ──────────────────────────────────────────────────────────────
@@ -55,6 +60,13 @@ MAX_MFG_YEAR = CURRENT_YEAR + 1
 def normalize_path(path):
     """Ensure S3 path ends with a trailing slash."""
     return path if path.endswith("/") else path + "/"
+
+
+def derive_quarantine_path(bronze_ingested_path):
+    """Derive quarantine base from bronze ingested path.
+    e.g. s3://bucket/prefix/ingested/ → s3://bucket/prefix/quarantine/
+    """
+    return bronze_ingested_path.replace("/ingested/", "/quarantine/")
 
 
 def silver_table_exists(spark, path):
@@ -67,6 +79,62 @@ def silver_table_exists(spark, path):
 
 
 # ──────────────────────────────────────────────────────────────
+# Quarantine Helpers
+# ──────────────────────────────────────────────────────────────
+def _tag_rejected(df, reason):
+    """Tag rejected rows with reason. Preserves all columns including
+    bronze metadata (load_date, batch_id, ingestion_timestamp, source_file_name).
+    """
+    return (
+        df.select([col(c).cast("string").alias(c) for c in df.columns])
+        .withColumn("rejection_reason", lit(reason))
+        .withColumn("rejected_at", current_timestamp())
+    )
+
+
+def write_quarantine(spark, quarantine_dfs, quarantine_base, table_name):
+    """Union all quarantine DFs and append to quarantine path.
+    Uses batch_id from bronze metadata for idempotency.
+    """
+    if not quarantine_dfs:
+        print(f"[{table_name}] ✓ No rows quarantined")
+        return
+
+    combined = quarantine_dfs[0]
+    for qdf in quarantine_dfs[1:]:
+        combined = combined.unionByName(qdf, allowMissingColumns=True)
+
+    count = combined.count()
+    if count == 0:
+        print(f"[{table_name}] ✓ No rows quarantined")
+        return
+
+    output_path = f"{quarantine_base}{table_name}"
+
+    # ── Idempotency: skip if batch_id already in quarantine ──
+    if "batch_id" in combined.columns:
+        batch_ids = [
+            r["batch_id"] for r in
+            combined.select("batch_id").distinct().collect()
+            if r["batch_id"] is not None
+        ]
+        if batch_ids:
+            try:
+                existing = spark.read.parquet(output_path)
+                already = existing.filter(
+                    col("batch_id").isin(batch_ids)
+                ).select("batch_id").distinct().count()
+                if already > 0:
+                    print(f"[{table_name}] ⚠ batch_id already in quarantine — skipping (idempotent)")
+                    return
+            except Exception:
+                pass  # Quarantine doesn't exist yet
+
+    combined.write.mode("append").parquet(output_path)
+    print(f"[{table_name}] ✗ Quarantined {count} rejected rows → {output_path}")
+
+
+# ──────────────────────────────────────────────────────────────
 # Data Cleaning
 # ──────────────────────────────────────────────────────────────
 def clean_snapshot(spark, bronze_df, silver_path):
@@ -74,22 +142,31 @@ def clean_snapshot(spark, bronze_df, silver_path):
     Clean incoming Bronze vehicle registry snapshot.
     Enforces null handling, dedup, validation, baseline derivation,
     and ER schema alignment.
+
+    Returns:
+        (clean_df, quarantine_dfs): Tuple of the cleaned DataFrame and a list
+        of DataFrames containing rejected rows tagged with rejection reasons.
     """
-    # ── Drop NULL/empty VIN (primary key) ──
+    quarantine_dfs = []
+
+    # ── Quarantine NULL/empty VIN (primary key) ──
+    rejected_vin = bronze_df.filter(col("vin").isNull() | (col("vin") == ""))
     df = bronze_df.filter(col("vin").isNotNull() & (col("vin") != ""))
-    dropped = bronze_df.count() - df.count()
+    dropped = rejected_vin.count()
     if dropped > 0:
-        print(f"[dim_vehicle] Dropped {dropped} rows with NULL/empty VIN")
+        print(f"[dim_vehicle] Rejected {dropped} rows with NULL/empty VIN")
+        quarantine_dfs.append(_tag_rejected(rejected_vin, "NULL_OR_EMPTY_VIN"))
 
     # ── Normalize VIN → UPPERCASE ──
     df = df.withColumn("vin", trim(upper(col("vin"))))
 
-    # ── Drop NULL/empty model (needed for baseline derivation) ──
-    before_model = df.count()
+    # ── Quarantine NULL/empty model (needed for baseline derivation) ──
+    rejected_model = df.filter(col("model").isNull() | (trim(col("model")) == ""))
     df = df.filter(col("model").isNotNull() & (trim(col("model")) != ""))
-    dropped_model = before_model - df.count()
+    dropped_model = rejected_model.count()
     if dropped_model > 0:
-        print(f"[dim_vehicle] Dropped {dropped_model} rows with NULL/empty model")
+        print(f"[dim_vehicle] Rejected {dropped_model} rows with NULL/empty model")
+        quarantine_dfs.append(_tag_rejected(rejected_model, "NULL_OR_EMPTY_MODEL"))
 
     # ── Normalize model: TRIM + UPPER ──
     df = df.withColumn("model", trim(upper(col("model"))))
@@ -104,20 +181,31 @@ def clean_snapshot(spark, bronze_df, silver_path):
         ).otherwise(trim(upper(col("fuel_type"))))
     )
 
-    # ── Validate fuel_type against BRD-allowed values ──
+    # ── Quarantine invalid fuel_type (not in BRD-allowed values) ──
     # NULLs are excluded since isin() returns NULL for NULL inputs → filtered out.
+    rejected_fuel = df.filter(~col("fuel_type").isin(list(VALID_FUEL_TYPES)))
     df = df.filter(col("fuel_type").isin(list(VALID_FUEL_TYPES)))
+    dropped_fuel = rejected_fuel.count()
+    if dropped_fuel > 0:
+        print(f"[dim_vehicle] Rejected {dropped_fuel} rows with invalid/NULL fuel_type")
+        quarantine_dfs.append(_tag_rejected(rejected_fuel, "INVALID_OR_NULL_FUEL_TYPE"))
 
-    # ── Default NULL mfg_year → 0, validate range ──
+    # ── Cast mfg_year to int (NULL stays NULL), quarantine out-of-range ──
+    # Valid range: [2000, current_year]. NULL and 0 are both quarantined.
     df = df.withColumn(
         "mfg_year",
         when(col("mfg_year").cast(IntegerType()).isNull(), lit(0))
         .otherwise(col("mfg_year").cast(IntegerType()))
     )
-    df = df.filter(
-        (col("mfg_year") == 0)
-        | ((col("mfg_year") >= MIN_MFG_YEAR) & (col("mfg_year") <= MAX_MFG_YEAR))
+    valid_year_condition = (
+        (col("mfg_year") >= MIN_MFG_YEAR) & (col("mfg_year") <= MAX_MFG_YEAR)
     )
+    rejected_year = df.filter(~valid_year_condition)
+    df = df.filter(valid_year_condition)
+    dropped_year = rejected_year.count()
+    if dropped_year > 0:
+        print(f"[dim_vehicle] Rejected {dropped_year} rows with NULL/0/out-of-range mfg_year (valid: {MIN_MFG_YEAR}–{MAX_MFG_YEAR})")
+        quarantine_dfs.append(_tag_rejected(rejected_year, "MFG_YEAR_OUT_OF_RANGE"))
 
     # ── Dedup by VIN (within single partition, pick one deterministically) ──
     dedup_window = Window.partitionBy("vin").orderBy(col("vin"))
@@ -176,12 +264,13 @@ def clean_snapshot(spark, bronze_df, silver_path):
         )
         df = df.drop("batch_avg")
 
-    # Step 4: Drop rows where baseline is still NULL (model never seen before)
-    before_baseline = df.count()
+    # Step 4: Quarantine rows where baseline is still NULL (model never seen before)
+    rejected_baseline = df.filter(col("baseline_efficiency").isNull())
     df = df.filter(col("baseline_efficiency").isNotNull())
-    dropped_baseline = before_baseline - df.count()
+    dropped_baseline = rejected_baseline.count()
     if dropped_baseline > 0:
-        print(f"[dim_vehicle] Dropped {dropped_baseline} rows — model has no baseline data anywhere")
+        print(f"[dim_vehicle] Rejected {dropped_baseline} rows — model has no baseline data anywhere")
+        quarantine_dfs.append(_tag_rejected(rejected_baseline, "NO_BASELINE_EFFICIENCY"))
 
     # ── Build final Silver schema (no audit_run_id) ──
     df = df.select(
@@ -196,7 +285,7 @@ def clean_snapshot(spark, bronze_df, silver_path):
         lit(True).alias("is_active"),
     )
 
-    return df
+    return df, quarantine_dfs
 
 
 # ──────────────────────────────────────────────────────────────
@@ -223,7 +312,12 @@ def run(spark, run_date, bronze_base, silver_path):
         print("[dim_vehicle] ⚠ No data. Skipping.")
         return
 
-    incoming_df = clean_snapshot(spark, bronze_df, silver_path)
+    incoming_df, quarantine_dfs = clean_snapshot(spark, bronze_df, silver_path)
+
+    # ── Write quarantined rows to bronze quarantine ──
+    quarantine_base = derive_quarantine_path(bronze_base)
+    write_quarantine(spark, quarantine_dfs, quarantine_base, TABLE_NAME)
+
     count = incoming_df.count()
     print(f"[dim_vehicle] After cleaning: {count} rows")
     if count == 0:
@@ -254,7 +348,17 @@ def run(spark, run_date, bronze_base, silver_path):
                     "updated_at":         current_timestamp(),
                 }
             )
-            .whenNotMatchedInsertAll()
+            .whenNotMatchedInsert(values={
+                "vehicle_sk":          "incoming.vehicle_sk",
+                "vin":                 "incoming.vin",
+                "model":               "incoming.model",
+                "fuel_type":           "incoming.fuel_type",
+                "mfg_year":            "incoming.mfg_year",
+                "baseline_efficiency": "incoming.baseline_efficiency",
+                "created_at":          "incoming.created_at",
+                "updated_at":          "incoming.updated_at",
+                "is_active":           "incoming.is_active",
+            })
             .whenNotMatchedBySourceUpdate(
                 condition="existing.is_active = TRUE",
                 set={
@@ -275,8 +379,7 @@ def run(spark, run_date, bronze_base, silver_path):
         # After MERGE, Delta keeps old Parquet files for time travel.
         # VACUUM(0) removes ALL old files, keeping only the latest version.
         # This saves S3 storage costs but disables time travel to older versions.
-        spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")
-        DeltaTable.forPath(spark, silver_path).vacuum(0)
+        DeltaTable.forPath(spark, silver_path).vacuum()
         print("[dim_vehicle] ✓ VACUUM complete — old Parquet files deleted.")
 
     else:

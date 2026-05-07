@@ -8,11 +8,17 @@ Reads ONLY today's partition from Bronze (partition pruning on load_date),
 cleans it, derives status, and MERGEs into the Silver Delta table.
 
 Null Handling (Silver enforcement):
-  - vin NULL/empty            → DROP ROW (FK)
-  - driver_id NULL/empty      → DROP ROW (FK)
-  - start_timestamp NULL      → DROP ROW (can't derive start_date)
-  - daily_rate NULL/≤0        → DROP ROW
+  - vin NULL/empty            → QUARANTINE ROW (FK)
+  - driver_id NULL/empty      → QUARANTINE ROW (FK)
+  - start_timestamp NULL      → QUARANTINE ROW (can't derive start_date)
+  - daily_rate NULL/≤0        → QUARANTINE ROW
+  - driver SUSPENDED          → QUARANTINE ROW (pre-merge) / ARCHIVE (post-merge)
   - region NULL/empty         → Left as NULL
+
+Quarantine:
+  - Rejected rows appended to bronze quarantine/{table_name}/ as Parquet
+  - Bronze metadata (load_date, batch_id, etc.) preserved on quarantined rows
+  - batch_id used for idempotency — re-runs skip if batch already quarantined
 
 Bronze data is NOT moved — stays in ingested/ for auditability.
 
@@ -26,6 +32,11 @@ Glue Job Parameters:
   --bronze_ingested_path  : Base S3 path for Bronze ingested data
   --silver_output_path    : S3 path for Silver Delta table output
   --silver_vehicle_path   : S3 path to Silver vehicle registry (for active VIN filter)
+  --pg_host               : PostgreSQL host (for driver safety status lookup)
+  --pg_port               : PostgreSQL port (default 5432)
+  --pg_database           : PostgreSQL database name
+  --pg_user               : PostgreSQL username
+  --pg_password           : PostgreSQL password
 """
 
 import sys
@@ -59,6 +70,20 @@ def normalize_path(path):
     return path if path.endswith("/") else path + "/"
 
 
+def derive_quarantine_path(bronze_ingested_path):
+    """Derive quarantine base from bronze ingested path.
+    e.g. s3://bucket/prefix/ingested/ → s3://bucket/prefix/quarantine/
+    """
+    return bronze_ingested_path.replace("/ingested/", "/quarantine/")
+
+
+def derive_future_path(bronze_ingested_path):
+    """Derive future_vehicle_assignments base from bronze ingested path.
+    e.g. s3://bucket/prefix/ingested/ → s3://bucket/prefix/ingested/future_vehicle_assignments/
+    """
+    return bronze_ingested_path + "future_vehicle_assignments/"
+
+
 def silver_table_exists(spark, path):
     """Check whether the Silver Delta table already exists."""
     try:
@@ -68,24 +93,123 @@ def silver_table_exists(spark, path):
         return False
 
 
+def load_suspended_drivers(spark, jdbc_url, connection_props):
+    """Read SUSPENDED drivers from PostgreSQL report.driver_safety_status.
+
+    Returns a DataFrame of suspended driver_ids, or None if the table
+    is empty, unreachable, or has no suspended drivers.
+    Drivers NOT in this table are treated as ACTIVE (no filtering).
+    """
+    try:
+        df = (
+            spark.read.jdbc(
+                url=jdbc_url,
+                table="report.driver_safety_status",
+                properties=connection_props,
+            )
+            .filter(col("status") == "SUSPENDED")
+            .select(col("driver_id").alias("suspended_driver_id"))
+        )
+        count = df.count()
+        print(f"[dim_vehicle_assignment_scd2] Suspended drivers in PostgreSQL: {count}")
+        return df if count > 0 else None
+    except Exception as e:
+        print(f"[dim_vehicle_assignment_scd2] ⚠ Could not read driver_safety_status from PostgreSQL: {e}")
+        print("[dim_vehicle_assignment_scd2] ⚠ Treating all drivers as ACTIVE (no suspended driver filtering).")
+        return None
+
+
+# ──────────────────────────────────────────────────────────────
+# Quarantine Helpers
+# ──────────────────────────────────────────────────────────────
+def _tag_rejected(df, reason):
+    """Tag rejected rows with reason. Preserves all columns including
+    bronze metadata (load_date, batch_id, ingestion_timestamp, source_file_name).
+    """
+    return (
+        df.select([col(c).cast("string").alias(c) for c in df.columns])
+        .withColumn("rejection_reason", lit(reason))
+        .withColumn("rejected_at", current_timestamp())
+    )
+
+
+def write_quarantine(spark, quarantine_dfs, quarantine_base, table_name):
+    """Union all quarantine DFs and append to quarantine path.
+    Uses batch_id from bronze metadata for idempotency.
+    """
+    if not quarantine_dfs:
+        print(f"[{table_name}] ✓ No rows quarantined")
+        return
+
+    combined = quarantine_dfs[0]
+    for qdf in quarantine_dfs[1:]:
+        combined = combined.unionByName(qdf, allowMissingColumns=True)
+
+    count = combined.count()
+    if count == 0:
+        print(f"[{table_name}] ✓ No rows quarantined")
+        return
+
+    output_path = f"{quarantine_base}{table_name}"
+
+    # ── Idempotency: skip if batch_id already in quarantine ──
+    if "batch_id" in combined.columns:
+        batch_ids = [
+            r["batch_id"] for r in
+            combined.select("batch_id").distinct().collect()
+            if r["batch_id"] is not None
+        ]
+        if batch_ids:
+            try:
+                existing = spark.read.parquet(output_path)
+                already = existing.filter(
+                    col("batch_id").isin(batch_ids)
+                ).select("batch_id").distinct().count()
+                if already > 0:
+                    print(f"[{table_name}] ⚠ batch_id already in quarantine — skipping (idempotent)")
+                    return
+            except Exception:
+                pass  # Quarantine doesn't exist yet
+
+    combined.write.mode("append").parquet(output_path)
+    print(f"[{table_name}] ✗ Quarantined {count} rejected rows → {output_path}")
+
+
 # ──────────────────────────────────────────────────────────────
 # Data Cleaning
 # ──────────────────────────────────────────────────────────────
-def clean_incoming_batch(bronze_df):
+def clean_incoming_batch(bronze_df, run_date, suspended_df=None):
     """
     Clean a batch of Bronze vehicle assignment records.
-    Enforces null handling, dedup, status derivation, and ER schema.
+    Enforces null handling, dedup, status derivation, suspended driver
+    check, and ER schema.
+
+    Args:
+        bronze_df: Raw Bronze DataFrame
+        run_date: Date string (YYYY-MM-DD)
+        suspended_df: Optional DataFrame of suspended driver_ids from PostgreSQL.
+                      If None, suspended driver check is skipped.
+
+    Returns:
+        (clean_df, quarantine_dfs): Tuple of the cleaned DataFrame and a list
+        of DataFrames containing rejected rows tagged with rejection reasons.
     """
+    quarantine_dfs = []
     total_before = bronze_df.count()
 
-    # ── Drop NULL vin or driver_id (both required FKs) ──
+    # ── Quarantine NULL vin or driver_id (both required FKs) ──
+    rejected_keys = bronze_df.filter(
+        col("vin").isNull() | (col("vin") == "")
+        | col("driver_id").isNull() | (col("driver_id") == "")
+    )
     df = bronze_df.filter(
         col("vin").isNotNull() & (col("vin") != "")
         & col("driver_id").isNotNull() & (col("driver_id") != "")
     )
-    dropped_keys = total_before - df.count()
+    dropped_keys = rejected_keys.count()
     if dropped_keys > 0:
-        print(f"[dim_vehicle_assignment_scd2] Dropped {dropped_keys} rows with NULL vin/driver_id")
+        print(f"[dim_vehicle_assignment_scd2] Rejected {dropped_keys} rows with NULL vin/driver_id")
+        quarantine_dfs.append(_tag_rejected(rejected_keys, "NULL_OR_EMPTY_VIN_OR_DRIVER_ID"))
 
     # ── Normalize VIN + driver_id → UPPERCASE ──
     df = df.withColumn("vin", trim(upper(col("vin"))))
@@ -115,22 +239,52 @@ def clean_incoming_batch(bronze_df):
         )
     )
 
-    # ── Drop rows where start_timestamp couldn't be parsed ──
-    before_start = df.count()
+    # ── Quarantine rows where start_timestamp couldn't be parsed ──
+    rejected_start = df.filter(col("start_date").isNull())
     df = df.filter(col("start_date").isNotNull())
-    dropped_start = before_start - df.count()
+    dropped_start = rejected_start.count()
     if dropped_start > 0:
-        print(f"[dim_vehicle_assignment_scd2] Dropped {dropped_start} rows with NULL start_date")
+        print(f"[dim_vehicle_assignment_scd2] Rejected {dropped_start} rows with NULL start_date")
+        quarantine_dfs.append(_tag_rejected(rejected_start, "NULL_OR_INVALID_START_TIMESTAMP"))
 
-    # ── Drop NULL/invalid daily_rate ──
-    before_rate = df.count()
+    # ── Quarantine NULL/invalid daily_rate ──
+    rejected_rate = df.filter(
+        col("daily_rate").cast(FloatType()).isNull()
+        | (col("daily_rate").cast(FloatType()) <= 0)
+    )
     df = df.filter(
         col("daily_rate").cast(FloatType()).isNotNull()
         & (col("daily_rate").cast(FloatType()) > 0)
     )
-    dropped_rate = before_rate - df.count()
+    dropped_rate = rejected_rate.count()
     if dropped_rate > 0:
-        print(f"[dim_vehicle_assignment_scd2] Dropped {dropped_rate} rows with NULL/invalid daily_rate")
+        print(f"[dim_vehicle_assignment_scd2] Rejected {dropped_rate} rows with NULL/invalid daily_rate")
+        quarantine_dfs.append(_tag_rejected(rejected_rate, "NULL_OR_INVALID_DAILY_RATE"))
+
+    # ── Quarantine assignments where driver is SUSPENDED in PostgreSQL ──
+    if suspended_df is not None:
+        rejected_suspended = df.join(
+            suspended_df,
+            trim(upper(col("driver_id"))) == col("suspended_driver_id"),
+            "inner"
+        ).drop("suspended_driver_id")
+        df = df.join(
+            suspended_df,
+            trim(upper(col("driver_id"))) == col("suspended_driver_id"),
+            "left_anti"
+        )
+        dropped_suspended = rejected_suspended.count()
+        if dropped_suspended > 0:
+            print(f"[dim_vehicle_assignment_scd2] Rejected {dropped_suspended} rows — driver SUSPENDED")
+            quarantine_dfs.append(_tag_rejected(rejected_suspended, "DRIVER_SUSPENDED"))
+
+    # ── Quarantine rows where start_date > end_date ──
+    rejected_logic = df.filter(col("end_date").isNotNull() & (col("start_date") > col("end_date")))
+    df = df.filter(col("end_date").isNull() | (col("start_date") <= col("end_date")))
+    dropped_logic = rejected_logic.count()
+    if dropped_logic > 0:
+        print(f"[dim_vehicle_assignment_scd2] Rejected {dropped_logic} rows with start_date > end_date")
+        quarantine_dfs.append(_tag_rejected(rejected_logic, "START_DATE_AFTER_END_DATE"))
 
     # ── region: leave NULL as-is, TRIM + UPPER non-null values ──
     df = df.withColumn(
@@ -142,22 +296,24 @@ def clean_incoming_batch(bronze_df):
     )
 
     # ── Dedup WITHIN batch: same VIN + same start_date → keep highest daily_rate ──
-    dedup_window = Window.partitionBy("vin").orderBy(col("daily_rate").desc())                    #change here now just start date gyi yaha se 
+    dedup_window = Window.partitionBy("vin", "start_date").orderBy(col("daily_rate").desc())
     df = (
         df.withColumn("_rn", row_number().over(dedup_window))
         .filter(col("_rn") == 1)
         .drop("_rn")
     )
 
-    # ── Derive status and is_current from end_date ──
+    # ── Derive status and is_current using run_date ──
     df = (
         df
         .withColumn(
-            "status",
-            when(col("end_date").isNull(), lit("IN-TRANSIT"))
-            .otherwise(lit("ARCHIVED"))
+            "is_current",
+            col("end_date").isNull() | (col("end_date") >= lit(run_date))
         )
-        .withColumn("is_current", col("end_date").isNull())
+        .withColumn(
+            "status",
+            when(col("is_current"), lit("IN-TRANSIT")).otherwise(lit("ARCHIVED"))
+        )
     )
 
     # ── Build final Silver schema (no audit_run_id) ──
@@ -179,17 +335,19 @@ def clean_incoming_batch(bronze_df):
         current_timestamp().alias("updated_at"),
     )
 
-    return df
+    return df, quarantine_dfs
 
 
 # ──────────────────────────────────────────────────────────────
 # Core Transformation Logic
 # ──────────────────────────────────────────────────────────────
-def run(spark, run_date, bronze_base, silver_path, silver_vehicle_path):
+def run(spark, run_date, bronze_base, silver_path, silver_vehicle_path,
+        jdbc_url=None, connection_props=None):
     """
     INCREMENTAL Silver transformation for vehicle_assignment.
     Reads only today's Bronze partition. Bronze data stays in place.
     Only VINs active in the Silver Vehicle Registry are kept.
+    Drivers SUSPENDED in PostgreSQL driver_safety_status are quarantined/archived.
     """
     bronze_partition_path = f"{bronze_base}{TABLE_NAME}/load_date={run_date}"
     print(f"[dim_vehicle_assignment_scd2] run_date={run_date}")
@@ -199,20 +357,91 @@ def run(spark, run_date, bronze_base, silver_path, silver_vehicle_path):
         bronze_df = spark.read.parquet(bronze_partition_path)
     except Exception as e:
         print(f"[dim_vehicle_assignment_scd2] ⚠ No Bronze partition for {run_date}: {e}")
+        bronze_df = None
+
+    # Load existing future assignments
+    future_path = derive_future_path(bronze_base)
+    try:
+        future_df = spark.read.parquet(future_path)
+        future_df = future_df.localCheckpoint(eager=True) # Break lineage and fully materialize to avoid self-overwrite bugs
+        future_df_count = future_df.count()
+        print(f"[dim_vehicle_assignment_scd2] Loaded existing future assignments: {future_df_count} rows")
+    except Exception:
+        future_df = None
+
+    if bronze_df is None and future_df is None:
+        print("[dim_vehicle_assignment_scd2] ⚠ Empty partition and no future assignments. Skipping.")
         return
 
-    total = bronze_df.count()
-    print(f"[dim_vehicle_assignment_scd2] Bronze rows read: {total}")
+    if bronze_df is not None and future_df is not None:
+        combined_df = bronze_df.unionByName(future_df, allowMissingColumns=True)
+    elif bronze_df is not None:
+        combined_df = bronze_df
+    else:
+        combined_df = future_df
+
+    total = combined_df.count()
+    print(f"[dim_vehicle_assignment_scd2] Total rows (incoming + past future): {total}")
     if total == 0:
-        print("[dim_vehicle_assignment_scd2] ⚠ Empty partition. Skipping.")
+        print("[dim_vehicle_assignment_scd2] ⚠ Empty incoming data. Skipping.")
         return
 
-    incoming_df = clean_incoming_batch(bronze_df)
+    # Extract start_date to separate future vs current records
+    combined_df = combined_df.withColumn(
+        "tmp_start_date",
+        to_date(from_unixtime(col("start_timestamp").cast(LongType())).cast("timestamp"))
+    )
+
+    future_bronze_df = combined_df.filter(col("tmp_start_date") > lit(run_date)).drop("tmp_start_date")
+    past_bronze_df = combined_df.filter(col("tmp_start_date") < lit(run_date)).drop("tmp_start_date")
+    current_bronze_df = combined_df.filter(
+        (col("tmp_start_date") == lit(run_date)) | col("tmp_start_date").isNull()
+    ).drop("tmp_start_date")
+
+    # Overwrite future assignments
+    future_count = future_bronze_df.count()
+    if future_count > 0:
+        future_bronze_df.write.mode("overwrite").parquet(future_path)
+        print(f"[dim_vehicle_assignment_scd2] Saved {future_count} future assignments to {future_path}")
+    else:
+        # Overwrite with empty DF if there were future assignments previously
+        if future_df is not None:
+            empty_df = spark.createDataFrame([], future_bronze_df.schema)
+            empty_df.write.mode("overwrite").parquet(future_path)
+        print(f"[dim_vehicle_assignment_scd2] Saved 0 future assignments to {future_path}")
+
+    current_count = current_bronze_df.count()
+    print(f"[dim_vehicle_assignment_scd2] Records to process today: {current_count}")
+    
+    quarantine_dfs = []
+    
+    past_count = past_bronze_df.count()
+    if past_count > 0:
+        print(f"[dim_vehicle_assignment_scd2] Found {past_count} past assignments. Quarantining...")
+        past_quarantine_df = _tag_rejected(past_bronze_df, "PAST_ASSIGNMENT_DATE")
+        quarantine_dfs.append(past_quarantine_df)
+
+    # ── Load suspended drivers from PostgreSQL (if available) ──
+    suspended_df = None
+    if jdbc_url and connection_props:
+        suspended_df = load_suspended_drivers(spark, jdbc_url, connection_props)
+
+    incoming_df, batch_quarantine_dfs = clean_incoming_batch(current_bronze_df, run_date, suspended_df)
+    quarantine_dfs.extend(batch_quarantine_dfs)
+
+    # ── Write quarantined rows to bronze quarantine ──
+    quarantine_base = derive_quarantine_path(bronze_base)
+    write_quarantine(spark, quarantine_dfs, quarantine_base, TABLE_NAME)
+
     count = incoming_df.count()
     print(f"[dim_vehicle_assignment_scd2] After cleaning: {count} rows")
-    if count == 0:
-        print("[dim_vehicle_assignment_scd2] ⚠ All rows filtered out. Skipping.")
+    if count == 0 and past_count == 0:
+        print("[dim_vehicle_assignment_scd2] ⚠ All rows filtered out and no past records to quarantine. Skipping.")
         return
+    elif count == 0:
+        print("[dim_vehicle_assignment_scd2] ⚠ All rows filtered out. Skipping merge.")
+        return
+
 
     # ── NO pre-MERGE VIN filter — we MERGE all incoming data first, ──
     # ── then archive assignments for inactive VINs post-MERGE.      ──
@@ -258,6 +487,31 @@ def run(spark, run_date, bronze_base, silver_path, silver_vehicle_path):
         ).count()
         print(f"[dim_vehicle_assignment_scd2] Pass 1 done. Total ARCHIVED records: {closed_count}")
 
+        # ─── PASS 1.5: Enforce 1 Driver = 1 Vehicle ───
+        # If the incoming data assigns a driver to a NEW vehicle, we must close
+        # any OTHER vehicles that driver is currently assigned to.
+        print("[dim_vehicle_assignment_scd2] Pass 1.5: Closing old vehicles for reassigned drivers...")
+        silver_table_p1_5 = DeltaTable.forPath(spark, silver_path)
+        (
+            silver_table_p1_5.alias("existing")
+            .merge(
+                incoming_df.alias("incoming"),
+                "existing.driver_id = incoming.driver_id AND existing.is_current = TRUE"
+            )
+            .whenMatchedUpdate(
+                # Close the driver's old vehicle assignment
+                condition="existing.vin != incoming.vin",
+                set={
+                    "end_date":       "incoming.start_date",
+                    "end_datetime":   "incoming.start_datetime",
+                    "is_current":     lit(False),
+                    "status":         lit("ARCHIVED"),
+                    "updated_at":     current_timestamp(),
+                }
+            )
+            .execute()
+        )
+
         # ─── PASS 2: Insert new records / Update existing records ───
         # Match: same VIN + same start_date (unique assignment key)
         # - If matched AND data changed → UPDATE (rate correction, driver swap)
@@ -277,6 +531,7 @@ def run(spark, run_date, bronze_base, silver_path, silver_vehicle_path):
                     OR (incoming.end_date IS NOT NULL AND existing.end_date IS NULL)
                     OR (incoming.end_date IS NULL AND existing.end_date IS NOT NULL)
                     OR (incoming.end_date != existing.end_date)
+                    OR (incoming.status != existing.status)
                 """,
                 set={
                     "driver_id":      "incoming.driver_id",
@@ -290,13 +545,58 @@ def run(spark, run_date, bronze_base, silver_path, silver_vehicle_path):
                     "updated_at":     current_timestamp(),
                 }
             )
-            .whenNotMatchedInsertAll()
+            .whenNotMatchedInsert(values={
+                "assignment_sk":  "incoming.assignment_sk",
+                "vehicle_sk":     "incoming.vehicle_sk",
+                "driver_sk":      "incoming.driver_sk",
+                "vin":            "incoming.vin",
+                "driver_id":      "incoming.driver_id",
+                "region":         "incoming.region",
+                "daily_rate":     "incoming.daily_rate",
+                "start_datetime": "incoming.start_datetime",
+                "start_date":     "incoming.start_date",
+                "end_datetime":   "incoming.end_datetime",
+                "end_date":       "incoming.end_date",
+                "is_current":     "incoming.is_current",
+                "status":         "incoming.status",
+                "created_at":     "incoming.created_at",
+                "updated_at":     "incoming.updated_at",
+            })
             .execute()
         )
 
         final_df = spark.read.format("delta").load(silver_path)
         active_before = final_df.filter(col("is_current") == True).count()   # noqa: E712
         print(f"[dim_vehicle_assignment_scd2] ✓ MERGE complete. IN-TRANSIT before registry check: {active_before}")
+
+        # ── POST-MERGE: Archive assignments where end_date < run_date ──
+        try:
+            expired_assignments = final_df.filter(
+                (col("is_current") == True) & 
+                col("end_date").isNotNull() & 
+                (col("end_date") < lit(run_date))
+            )
+            expired_count = expired_assignments.count()
+            if expired_count > 0:
+                silver_table_post_exp = DeltaTable.forPath(spark, silver_path)
+                silver_table_post_exp.update(
+                    condition=(
+                        (col("is_current") == True) &
+                        col("end_date").isNotNull() &
+                        (col("end_date") < lit(run_date))
+                    ),
+                    set={
+                        "is_current": lit(False),
+                        "status":     lit("ARCHIVED"),
+                        "updated_at": current_timestamp(),
+                    }
+                )
+                print(f"[dim_vehicle_assignment_scd2] ✓ Archived {expired_count} assignments — end_date passed")
+                
+                # Refresh final_df after update
+                final_df = spark.read.format("delta").load(silver_path)
+        except Exception as e:
+            print(f"[dim_vehicle_assignment_scd2] ⚠ Could not enforce expired end_date check: {e}")
 
         # ── POST-MERGE: Archive assignments whose VIN is no longer active ──
         # This catches BOTH today's incoming + all historical Silver records.
@@ -347,6 +647,45 @@ def run(spark, run_date, bronze_base, silver_path, silver_vehicle_path):
         except Exception as e:
             print(f"[dim_vehicle_assignment_scd2] ⚠ Could not enforce active VIN check: {e}. Skipping post-MERGE archive.")
 
+        # ── POST-MERGE: Archive assignments whose driver is now SUSPENDED ──
+        # Catches IN-TRANSIT assignments where the driver got suspended after assignment.
+        if suspended_df is not None:
+            try:
+                final_df_susp = spark.read.format("delta").load(silver_path)
+                suspended_assignments = (
+                    final_df_susp.filter(col("is_current") == True)  # noqa: E712
+                    .join(suspended_df, col("driver_id") == col("suspended_driver_id"), "inner")
+                    .select("vin", "start_date", "driver_id")
+                )
+                suspended_count = suspended_assignments.count()
+
+                if suspended_count > 0:
+                    suspended_driver_ids = [
+                        row["driver_id"] for row in
+                        suspended_assignments.select("driver_id").distinct().collect()
+                    ]
+                    print(f"[dim_vehicle_assignment_scd2] Drivers to archive (SUSPENDED): "
+                          f"{len(suspended_driver_ids)} drivers, {suspended_count} assignment records")
+
+                    silver_table_susp = DeltaTable.forPath(spark, silver_path)
+                    silver_table_susp.update(
+                        condition=(
+                            (col("is_current") == True) &  # noqa: E712
+                            col("driver_id").isin(suspended_driver_ids)
+                        ),
+                        set={
+                            "is_current": lit(False),
+                            "status":     lit("ARCHIVED"),
+                            "updated_at": current_timestamp(),
+                        }
+                    )
+                    print(f"[dim_vehicle_assignment_scd2] ✓ Archived {suspended_count} assignments — driver SUSPENDED")
+                else:
+                    print("[dim_vehicle_assignment_scd2] ✓ No current assignments have suspended drivers")
+
+            except Exception as e:
+                print(f"[dim_vehicle_assignment_scd2] ⚠ Could not enforce suspended driver check: {e}")
+
         # ── Final counts ──
         final_df2 = spark.read.format("delta").load(silver_path)
         active = final_df2.filter(col("is_current") == True).count()     # noqa: E712
@@ -357,8 +696,7 @@ def run(spark, run_date, bronze_base, silver_path, silver_vehicle_path):
         print(f"  Unique VINs with active assignment: {unique_active_vins}")
 
         # ── VACUUM: Delete old Parquet files no longer in Delta log ──
-        spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")
-        DeltaTable.forPath(spark, silver_path).vacuum(0)
+        DeltaTable.forPath(spark, silver_path).vacuum()
         print("[dim_vehicle_assignment_scd2] ✓ VACUUM complete — old Parquet files deleted.")
 
     else:
@@ -381,6 +719,11 @@ args = getResolvedOptions(sys.argv, [
     "bronze_ingested_path",
     "silver_output_path",
     "silver_vehicle_path",
+    "pg_host",
+    "pg_port",
+    "pg_database",
+    "pg_user",
+    "pg_password",
 ])
 
 # ── Delta Lake requires extensions set BEFORE SparkSession creation ──
@@ -400,15 +743,26 @@ silver_path = args["silver_output_path"].rstrip("/")
 silver_vehicle_path = args["silver_vehicle_path"].rstrip("/")
 run_date = args.get("run_date", str(date.today()))
 
+# ── Build JDBC URL and connection properties for PostgreSQL ──
+jdbc_url = f"jdbc:postgresql://{args['pg_host']}:{args['pg_port']}/{args['pg_database']}"
+connection_props = {
+    "user": args["pg_user"],
+    "password": args["pg_password"],
+    "driver": "org.postgresql.Driver",
+    "sslmode": "require",
+}
+
 print("=" * 60)
 print(f"  dim_vehicle_assignment_scd2 Silver Transformation — Glue Job")
 print(f"  Run Date     : {run_date}")
 print(f"  Bronze Base  : {bronze_base}")
 print(f"  Silver Path  : {silver_path}")
+print(f"  PG Host      : {args['pg_host']}")
 print("=" * 60)
 
 try:
-    run(spark, run_date, bronze_base, silver_path, silver_vehicle_path)
+    run(spark, run_date, bronze_base, silver_path, silver_vehicle_path,
+        jdbc_url, connection_props)
     print("✓ dim_vehicle_assignment_scd2 transformation completed successfully.")
 except Exception as e:
     print(f"✗ dim_vehicle_assignment_scd2 transformation failed: {e}")

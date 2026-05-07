@@ -8,11 +8,16 @@ Reads ONLY today's partition from Bronze (partition pruning on load_date),
 cleans it, adds exclusion flags, looks up driver_sk, and MERGEs.
 
 Null Handling (Silver enforcement):
-  - transaction_id NULL → DROP ROW (PK)
-  - vin NULL/empty      → DROP ROW (FK, can't compute efficiency)
-  - fuel_liters NULL/≤0 → DROP ROW (core metric)
-  - odometer NULL       → DROP ROW (core metric)
-  - timestamp NULL      → DROP ROW (can't derive date)
+  - transaction_id NULL → QUARANTINE ROW (PK)
+  - vin NULL/empty      → QUARANTINE ROW (FK, can't compute efficiency)
+  - fuel_liters NULL/≤0 → QUARANTINE ROW (core metric)
+  - odometer NULL/≤0   → QUARANTINE ROW (core metric)
+  - timestamp NULL      → QUARANTINE ROW (can't derive date)
+
+Quarantine:
+  - Rejected rows appended to bronze quarantine/{table_name}/ as Parquet
+  - Bronze metadata (load_date, batch_id, etc.) preserved on quarantined rows
+  - batch_id used for idempotency — re-runs skip if batch already quarantined
 
 Date columns (day_of_week, is_weekend) are NOT stored here — they live
 in dim_date, joined via date_id FK.
@@ -59,6 +64,13 @@ def normalize_path(path):
     return path if path.endswith("/") else path + "/"
 
 
+def derive_quarantine_path(bronze_ingested_path):
+    """Derive quarantine base from bronze ingested path.
+    e.g. s3://bucket/prefix/ingested/ → s3://bucket/prefix/quarantine/
+    """
+    return bronze_ingested_path.replace("/ingested/", "/quarantine/")
+
+
 def silver_table_exists(spark, path):
     """Check whether the Silver Delta table already exists."""
     try:
@@ -66,6 +78,62 @@ def silver_table_exists(spark, path):
         return True
     except Exception:
         return False
+
+
+# ──────────────────────────────────────────────────────────────
+# Quarantine Helpers
+# ──────────────────────────────────────────────────────────────
+def _tag_rejected(df, reason):
+    """Tag rejected rows with reason. Preserves all columns including
+    bronze metadata (load_date, batch_id, ingestion_timestamp, source_file_name).
+    """
+    return (
+        df.select([col(c).cast("string").alias(c) for c in df.columns])
+        .withColumn("rejection_reason", lit(reason))
+        .withColumn("rejected_at", current_timestamp())
+    )
+
+
+def write_quarantine(spark, quarantine_dfs, quarantine_base, table_name):
+    """Union all quarantine DFs and append to quarantine path.
+    Uses batch_id from bronze metadata for idempotency.
+    """
+    if not quarantine_dfs:
+        print(f"[{table_name}] ✓ No rows quarantined")
+        return
+
+    combined = quarantine_dfs[0]
+    for qdf in quarantine_dfs[1:]:
+        combined = combined.unionByName(qdf, allowMissingColumns=True)
+
+    count = combined.count()
+    if count == 0:
+        print(f"[{table_name}] ✓ No rows quarantined")
+        return
+
+    output_path = f"{quarantine_base}{table_name}"
+
+    # ── Idempotency: skip if batch_id already in quarantine ──
+    if "batch_id" in combined.columns:
+        batch_ids = [
+            r["batch_id"] for r in
+            combined.select("batch_id").distinct().collect()
+            if r["batch_id"] is not None
+        ]
+        if batch_ids:
+            try:
+                existing = spark.read.parquet(output_path)
+                already = existing.filter(
+                    col("batch_id").isin(batch_ids)
+                ).select("batch_id").distinct().count()
+                if already > 0:
+                    print(f"[{table_name}] ⚠ batch_id already in quarantine — skipping (idempotent)")
+                    return
+            except Exception:
+                pass  # Quarantine doesn't exist yet
+
+    combined.write.mode("append").parquet(output_path)
+    print(f"[{table_name}] ✗ Quarantined {count} rejected rows → {output_path}")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -140,6 +208,8 @@ def run(spark, run_date, bronze_base, silver_path,
     INCREMENTAL Silver transformation for fuel_transactions.
     Reads only today's Bronze partition. Bronze data stays in place.
     """
+    quarantine_dfs = []
+
     bronze_partition_path = f"{bronze_base}{TABLE_NAME}/load_date={run_date}"
     print(f"[fact_fuel] run_date={run_date}")
     print(f"[fact_fuel] Reading: {bronze_partition_path}")
@@ -156,14 +226,19 @@ def run(spark, run_date, bronze_base, silver_path,
         print("[fact_fuel] ⚠ Empty partition. Skipping.")
         return
 
-    # ── Drop rows with NULL essential keys ──
+    # ── Quarantine rows with NULL essential keys ──
+    rejected_keys = bronze_df.filter(
+        col("transaction_id").isNull() | (col("transaction_id") == "")
+        | col("vin").isNull() | (col("vin") == "")
+    )
     df = bronze_df.filter(
         col("transaction_id").isNotNull() & (col("transaction_id") != "")
         & col("vin").isNotNull() & (col("vin") != "")
     )
-    dropped_keys = total - df.count()
+    dropped_keys = rejected_keys.count()
     if dropped_keys > 0:
-        print(f"[fact_fuel] Dropped {dropped_keys} rows with NULL transaction_id/vin")
+        print(f"[fact_fuel] Rejected {dropped_keys} rows with NULL transaction_id/vin")
+        quarantine_dfs.append(_tag_rejected(rejected_keys, "NULL_OR_EMPTY_TRANSACTION_ID_OR_VIN"))
 
     # ── Normalize VIN + transaction_id → UPPERCASE ──
     df = df.withColumn("vin", trim(upper(col("vin"))))
@@ -174,18 +249,26 @@ def run(spark, run_date, bronze_base, silver_path,
         "transaction_timestamp",
         to_timestamp(col("timestamp"), "yyyy-MM-dd HH:mm:ss")
     )
-    before_ts = df.count()
+    rejected_ts = df.filter(col("transaction_timestamp").isNull())
     df = df.filter(col("transaction_timestamp").isNotNull())
-    dropped_ts = before_ts - df.count()
+    dropped_ts = rejected_ts.count()
     if dropped_ts > 0:
-        print(f"[fact_fuel] Dropped {dropped_ts} rows with unparseable timestamp")
+        print(f"[fact_fuel] Rejected {dropped_ts} rows with unparseable timestamp")
+        quarantine_dfs.append(_tag_rejected(rejected_ts, "UNPARSEABLE_TIMESTAMP"))
 
-    # ── Drop NULL/invalid fuel_liters and odometer ──
-    df = df.filter(
+    # ── Quarantine NULL/invalid fuel_liters and odometer ──
+    fuel_odo_condition = (
         col("fuel_liters").cast(FloatType()).isNotNull()
         & (col("fuel_liters").cast(FloatType()) > 0)
         & col("odometer_reading").cast(FloatType()).isNotNull()
+        & (col("odometer_reading").cast(FloatType()) > 0)
     )
+    rejected_metrics = df.filter(~fuel_odo_condition)
+    df = df.filter(fuel_odo_condition)
+    dropped_metrics = rejected_metrics.count()
+    if dropped_metrics > 0:
+        print(f"[fact_fuel] Rejected {dropped_metrics} rows with NULL/invalid fuel_liters or odometer")
+        quarantine_dfs.append(_tag_rejected(rejected_metrics, "NULL_OR_INVALID_FUEL_LITERS_OR_ODOMETER"))
 
     # ── Dedup by transaction_id ──
     dedup_window = Window.partitionBy("transaction_id").orderBy(col("transaction_timestamp"))
@@ -206,15 +289,19 @@ def run(spark, run_date, bronze_base, silver_path,
     target_date = str(date.fromisoformat(run_date) - td(days=1))
     print(f"[fact_fuel] run_date={run_date}, target transaction date={target_date}")
 
-    before_date_filter = df.count()
+    rejected_date = df.filter(col("txn_date") != lit(target_date))
     df = df.filter(col("txn_date") == lit(target_date))
-    dropped_date = before_date_filter - df.count()
+    dropped_date = rejected_date.count()
     if dropped_date > 0:
-        print(f"[fact_fuel] Dropped {dropped_date} rows — txn_date != {target_date}")
+        print(f"[fact_fuel] Rejected {dropped_date} rows — txn_date != {target_date}")
+        quarantine_dfs.append(_tag_rejected(rejected_date, f"TXN_DATE_NOT_TARGET_{target_date}"))
     print(f"[fact_fuel] After date filter (txn_date = {target_date}): {df.count()} rows")
 
     if df.count() == 0:
         print(f"[fact_fuel] ⚠ No transactions found for {target_date}. Skipping.")
+        # Still write quarantine for rows rejected so far
+        quarantine_base = derive_quarantine_path(bronze_base)
+        write_quarantine(spark, quarantine_dfs, quarantine_base, TABLE_NAME)
         return
 
     # ── Add flags and lookups (no weekend flags — those live in dim_date) ──
@@ -237,21 +324,29 @@ def run(spark, run_date, bronze_base, silver_path,
         active_vin_count = registry_df.count()
         print(f"[fact_fuel] Active VINs in vehicle registry: {active_vin_count}")
 
-        before_filter = df.count()
+        # Capture rows with inactive VINs for quarantine
+        rejected_inactive_vin = (
+            df.join(registry_df, col("vin") == col("reg_vin"), "left_anti")
+        )
         df = (
             df.join(registry_df, col("vin") == col("reg_vin"), "inner")
             .drop("reg_vin")
         )
         after_filter = df.count()
         unique_vins_after = df.select("vin").distinct().count()
-        dropped_inactive = before_filter - after_filter
+        dropped_inactive = rejected_inactive_vin.count()
 
         if dropped_inactive > 0:
-            print(f"[fact_fuel] Dropped {dropped_inactive} rows — VIN not active in vehicle registry")
+            print(f"[fact_fuel] Rejected {dropped_inactive} rows — VIN not active in vehicle registry")
+            quarantine_dfs.append(_tag_rejected(rejected_inactive_vin, "VIN_NOT_ACTIVE_IN_REGISTRY"))
         print(f"[fact_fuel] Unique VINs after registry check: {unique_vins_after}")
         print(f"[fact_fuel] After active VIN filter: {after_filter} rows")
     except Exception as e:
         print(f"[fact_fuel] ⚠ Could not read vehicle registry: {e}. Skipping active VIN filter.")
+
+    # ── Write quarantined rows to bronze quarantine ──
+    quarantine_base = derive_quarantine_path(bronze_base)
+    write_quarantine(spark, quarantine_dfs, quarantine_base, TABLE_NAME)
 
     # ── Select final Silver columns per ER ──
     # day_of_week and is_weekend are NOT included — they live in dim_date.
@@ -309,8 +404,7 @@ def run(spark, run_date, bronze_base, silver_path,
         # ── VACUUM: Delete old Parquet files no longer in Delta log ──
         # After insert-only MERGE, old Parquet files are no longer needed.
         # VACUUM(0) keeps only the latest version to save S3 storage.
-        spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")
-        DeltaTable.forPath(spark, silver_path).vacuum(0)
+        DeltaTable.forPath(spark, silver_path).vacuum()
         print("[fact_fuel] ✓ VACUUM complete — old Parquet files deleted.")
     else:
         # ── FIRST RUN (Bootstrap) ──
