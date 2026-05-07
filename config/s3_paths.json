@@ -29,7 +29,9 @@
         "base_prefix": "poc-bootcamp-group5-gold",
         "tables": {
             "fuel_efficiency_audit": "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-group5-gold/gold.fuel_efficiency_audit/",
-            "active_fleet_snapshot": "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-group5-gold/gold.active_fleet_snapshot/"
+            "active_fleet_snapshot": "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-group5-gold/gold.active_fleet_snapshot/",
+            "daily_safety_snapshot": "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-group5-gold/gold.daily_safety_snapshot/",
+            "monthly_rate_deduction": "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-group5-gold/gold.monthly_rate_deduction/"
         }
     },
     "glue": {
@@ -122,6 +124,17 @@
                 "timeout_minutes": 30,
                 "max_retries": 1,
                 "max_concurrent_runs": 1
+            },
+            "daily_safety_snapshot": {
+                "job_name": "daily_safety_snapshot_group5",
+                "script_location": "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-group5-gold/glue-scripts/daily_safety_snapshot_glue.py",
+                "iam_role_name": "SSM-Role-TTN-Bootcamp-2026-Role",
+                "glue_version": "4.0",
+                "worker_type": "G.1X",
+                "number_of_workers": 2,
+                "timeout_minutes": 15,
+                "max_retries": 1,
+                "max_concurrent_runs": 1
             }
         }
     },
@@ -147,6 +160,33 @@
                 "worker_type": "G.1X",
                 "number_of_workers": 2,
                 "timeout_minutes": 15,
+                "max_retries": 1,
+                "max_concurrent_runs": 1
+            }
+        }
+    },
+    "glue_monthly": {
+        "description": "AWS Glue job configuration — monthly jobs referenced by Airflow DAGs",
+        "jobs": {
+            "safety_strikes_reset": {
+                "job_name": "monthly_safety_strikes_reset_group5",
+                "script_location": "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-group5-gold/glue-scripts/monthly_safety_strikes_reset_glue.py",
+                "iam_role_name": "SSM-Role-TTN-Bootcamp-2026-Role",
+                "glue_version": "4.0",
+                "worker_type": "G.1X",
+                "number_of_workers": 2,
+                "timeout_minutes": 30,
+                "max_retries": 1,
+                "max_concurrent_runs": 1
+            },
+            "monthly_rate_deduction_report": {
+                "job_name": "monthly_rate_deduction_report_group5",
+                "script_location": "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-group5-gold/glue-scripts/monthly_rate_deduction_report_glue.py",
+                "iam_role_name": "SSM-Role-TTN-Bootcamp-2026-Role",
+                "glue_version": "4.0",
+                "worker_type": "G.1X",
+                "number_of_workers": 2,
+                "timeout_minutes": 45,
                 "max_retries": 1,
                 "max_concurrent_runs": 1
             }

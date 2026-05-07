@@ -5,6 +5,7 @@ Schedule: Daily @ 00:00 UTC
 
 Handles:
   - Daily: Bronze (registry + assignment) → Silver → Gold fleet snapshot
+          → Daily safety snapshot (Postgres → S3 archive)
   - Yearly: Maintenance schedules + dim_date (with Variable-based retry)
 
 DAG Dependency Graph:
@@ -27,6 +28,9 @@ DAG Dependency Graph:
     │     └───────────────────────────► yearly_gate ◄────────┘
     │
     ├── daily_bronze_midnight (registry + assignment)
+    │     │
+    │     ▼
+    │   daily_safety_snapshot
     │     │
     │     ▼
     │   silver_vehicle_registry
@@ -81,6 +85,7 @@ SILVER_DATE_PATH = config["silver"]["tables"]["dim_date"]
 
 # ── Gold S3 paths ──
 GOLD_FLEET_SNAPSHOT_PATH = config["gold"]["tables"]["active_fleet_snapshot"]
+GOLD_DAILY_SAFETY_SNAPSHOT_PATH = config["gold"]["tables"]["daily_safety_snapshot"]
 
 # ── Glue job configs ──
 GLUE_BRONZE = config["glue"]["jobs"]["bronze_ingest"]
@@ -88,6 +93,7 @@ GLUE_SILVER_REGISTRY = config["glue"]["jobs"]["silver_vehicle_registry"]
 GLUE_SILVER_ASSIGNMENT = config["glue"]["jobs"]["silver_vehicle_assignment"]
 GLUE_SILVER_MAINTENANCE = config["glue"]["jobs"]["silver_maintenance_schedules"]
 GLUE_GOLD_FLEET_SNAPSHOT = config["glue"]["jobs"]["gold_active_fleet_snapshot"]
+GLUE_DAILY_SAFETY_SNAPSHOT = config["glue"]["jobs"]["daily_safety_snapshot"]
 GLUE_YEARLY_BRONZE = config["glue_yearly"]["jobs"]["bronze_ingest"]
 GLUE_SILVER_DIM_DATE = config["glue_yearly"]["jobs"]["dim_date"]
 
@@ -302,6 +308,11 @@ with DAG(
             "--bronze_ingested_path": BRONZE_INGESTED_PATH,
             "--silver_output_path": SILVER_VEHICLE_ASSIGNMENT_PATH,
             "--silver_vehicle_path": SILVER_VEHICLE_REGISTRY_PATH,
+            "--pg_host": "{{ var.value.pg_host }}",
+            "--pg_port": "{{ var.value.get('pg_port', '5432') }}",
+            "--pg_database": "{{ var.value.pg_database }}",
+            "--pg_user": "{{ var.value.pg_user }}",
+            "--pg_password": "{{ var.value.pg_password }}",
         },
     )
 
@@ -317,6 +328,24 @@ with DAG(
     )
 
     # ══════════════════════════════════════════════════════════
+    # DAILY — Safety Snapshot (Postgres → S3 Gold archive)
+    # ══════════════════════════════════════════════════════════
+    daily_safety_snapshot = build_glue_task(
+        task_id="daily_safety_snapshot",
+        glue_config=GLUE_DAILY_SAFETY_SNAPSHOT,
+        script_args={
+            "--run_date":       RUN_DATE,
+            "--silver_assignment_path": SILVER_VEHICLE_ASSIGNMENT_PATH,
+            "--gold_output_path": GOLD_DAILY_SAFETY_SNAPSHOT_PATH,
+            "--pg_host":     "{{ var.value.pg_host }}",
+            "--pg_port":     "{{ var.value.get('pg_port', '5432') }}",
+            "--pg_database": "{{ var.value.pg_database }}",
+            "--pg_user":     "{{ var.value.pg_user }}",
+            "--pg_password": "{{ var.value.pg_password }}",
+        },
+    )
+
+    # ══════════════════════════════════════════════════════════
     # TASK DEPENDENCIES
     # ══════════════════════════════════════════════════════════
 
@@ -326,7 +355,7 @@ with DAG(
     check_yearly >> skip_yearly >> yearly_gate
 
     # Daily midnight path
-    start >> daily_bronze_midnight >> silver_registry >> silver_assignment >> gold_fleet_snapshot
+    start >> daily_bronze_midnight >> daily_safety_snapshot >> silver_registry >> silver_assignment >> gold_fleet_snapshot
 
     # End waits for both paths
     [gold_fleet_snapshot, yearly_gate] >> end

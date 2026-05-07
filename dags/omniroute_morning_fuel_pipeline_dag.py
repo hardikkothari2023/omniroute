@@ -1,7 +1,7 @@
 """
 OmniRoute — Morning Fuel Pipeline DAG (DAG 2 of 2)
 =====================================================
-Schedule: Daily @ 07:00 UTC
+Schedule: Daily @ 05:00 UTC
 
 Runs ONLY after the midnight pipeline (DAG 1) completes successfully.
 Uses ExternalTaskSensor to wait for omniroute_midnight_pipeline.end.
@@ -128,7 +128,7 @@ with DAG(
         "Morning pipeline: Waits for midnight pipeline success, then "
         "Bronze (fuel) → Silver fuel → Gold fuel audit → PostgreSQL."
     ),
-    schedule="0 7 * * *",              # Daily at 07:00 UTC
+    schedule="0 5 * * *",              # Daily at 05:00 UTC
     start_date=datetime(2026, 1, 1),
     catchup=False,
     tags=["bronze", "silver", "gold", "glue", "delta", "daily", "fuel", "morning"],
@@ -140,24 +140,24 @@ with DAG(
     # GATE — Wait for midnight pipeline to complete
     # ══════════════════════════════════════════════════════════
     # ExternalTaskSensor waits for the "end" task of the midnight
-    # pipeline to succeed. Both DAGs share the same data_interval
-    # (same ds) since they run on the same calendar day.
+    # pipeline to succeed.
     #
-    # execution_date_fn maps this DAG's logical_date to the
-    # midnight DAG's logical_date. Since both run daily:
-    #   Morning DAG (07:00 UTC, May 3) → ds = 2026-05-03
-    #   Midnight DAG (00:00 UTC, May 3) → ds = 2026-05-03
-    # They share the same ds, so no date offset is needed.
-    wait_for_midnight = ExternalTaskSensor(
-        task_id="wait_for_midnight_pipeline",
-        external_dag_id="omniroute_midnight_pipeline",
-        external_task_id="end",
-        mode="reschedule",            # Release worker between checks
-        poke_interval=120,            # Check every 2 minutes
-        timeout=3600,                 # Fail after 1 hour of waiting
-        allowed_states=["success"],
-        failed_states=["failed", "upstream_failed"],
-    )
+    # execution_delta maps this DAG's logical_date to the
+    # midnight DAG's logical_date.
+    #   Morning DAG: 05:00 UTC
+    #   Midnight DAG: 00:00 UTC
+    # We must subtract 5 hours from Morning to find Midnight's exact run.
+    # wait_for_midnight = ExternalTaskSensor(
+    #     task_id="wait_for_midnight_pipeline",
+    #     external_dag_id="omniroute_midnight_pipeline",
+    #     external_task_id="end",
+    #     execution_delta=timedelta(hours=5),
+    #     mode="reschedule",            # Release worker between checks
+    #     poke_interval=120,            # Check every 2 minutes
+    #     timeout=3600,                 # Fail after 1 hour of waiting
+    #     allowed_states=["success"],
+    #     failed_states=["failed", "upstream_failed"],
+    # )
 
     end = EmptyOperator(task_id="end")
 
@@ -245,4 +245,5 @@ with DAG(
     # ══════════════════════════════════════════════════════════
     # TASK DEPENDENCIES
     # ══════════════════════════════════════════════════════════
-    wait_for_midnight >> daily_bronze_fuel >> silver_fuel >> gold_fuel_audit >> gold_to_postgres >> end
+    # wait_for_midnight >> daily_bronze_fuel >> silver_fuel >> gold_fuel_audit >> gold_to_postgres >> end
+    daily_bronze_fuel >> silver_fuel >> gold_fuel_audit >> gold_to_postgres >> end
