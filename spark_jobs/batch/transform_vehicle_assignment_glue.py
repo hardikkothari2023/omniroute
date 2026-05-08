@@ -27,11 +27,20 @@ MERGE Logic:
   WHEN MATCHED AND data changed → UPDATE
   WHEN NOT MATCHED              → INSERT
 
+Maintenance / Temporary Absence Handling:
+  If a VIN is absent from the vehicle registry OR has a maintenance schedule on
+  run_date, but its assignment end_date is in the future, the assignment is NOT
+  permanently archived. Instead:
+    1. The current record is closed with end_date = run_date.
+    2. A future assignment is created with start_date = run_date + 1 day and the
+       original scheduled end_date, so the assignment auto-resumes the next day.
+
 Glue Job Parameters:
   --run_date              : Partition date (YYYY-MM-DD)
   --bronze_ingested_path  : Base S3 path for Bronze ingested data
   --silver_output_path    : S3 path for Silver Delta table output
   --silver_vehicle_path   : S3 path to Silver vehicle registry (for active VIN filter)
+  --silver_maintenance_path : S3 path to Silver maintenance Delta table
   --pg_host               : PostgreSQL host (for driver safety status lookup)
   --pg_port               : PostgreSQL port (default 5432)
   --pg_database           : PostgreSQL database name
@@ -40,7 +49,7 @@ Glue Job Parameters:
 """
 
 import sys
-from datetime import date
+from datetime import date, timedelta
 
 from awsglue.context import GlueContext
 from awsglue.job import Job
@@ -51,6 +60,7 @@ from pyspark.sql import Window
 from pyspark.sql.functions import (
     col, trim, upper, row_number, from_unixtime, to_date,
     current_timestamp, when, lit, sha2, concat_ws, to_timestamp,
+    date_add, concat,
 )
 from pyspark.sql.types import LongType, FloatType, DecimalType
 from delta.tables import DeltaTable
@@ -342,7 +352,7 @@ def clean_incoming_batch(bronze_df, run_date, suspended_df=None):
 # Core Transformation Logic
 # ──────────────────────────────────────────────────────────────
 def run(spark, run_date, bronze_base, silver_path, silver_vehicle_path,
-        jdbc_url=None, connection_props=None):
+        silver_maintenance_path=None, jdbc_url=None, connection_props=None):
     """
     INCREMENTAL Silver transformation for vehicle_assignment.
     Reads only today's Bronze partition. Bronze data stays in place.
@@ -598,8 +608,10 @@ def run(spark, run_date, bronze_base, silver_path, silver_vehicle_path,
         except Exception as e:
             print(f"[dim_vehicle_assignment_scd2] ⚠ Could not enforce expired end_date check: {e}")
 
-        # ── POST-MERGE: Archive assignments whose VIN is no longer active ──
-        # This catches BOTH today's incoming + all historical Silver records.
+        # ── POST-MERGE: Handle assignments whose VIN is no longer active ──
+        # Instead of permanently archiving all absent VINs, check if the
+        # assignment has a future end_date. If so, close the record and send
+        # a future assignment so it resumes when the vehicle returns.
         try:
             unique_vins_before = final_df.filter(col("is_current") == True).select("vin").distinct().count()  # noqa: E712
             print(f"[dim_vehicle_assignment_scd2] Unique VINs with is_current=True (before registry check): {unique_vins_before}")
@@ -616,36 +628,236 @@ def run(spark, run_date, bronze_base, silver_path, silver_vehicle_path,
             inactive_assignments = (
                 final_df.filter(col("is_current") == True)  # noqa: E712
                 .join(active_vins_df, col("vin") == col("reg_vin"), "left_anti")
-                .select("vin", "start_date")
             )
             inactive_count = inactive_assignments.count()
 
             if inactive_count > 0:
                 inactive_unique_vins = inactive_assignments.select("vin").distinct().count()
-                print(f"[dim_vehicle_assignment_scd2] VINs to archive (not in active registry): {inactive_unique_vins} unique VINs, {inactive_count} assignment records")
+                print(f"[dim_vehicle_assignment_scd2] VINs absent from active registry: {inactive_unique_vins} unique VINs, {inactive_count} assignment records")
 
-                # Use Delta UPDATE to archive these assignments
-                silver_table_post = DeltaTable.forPath(spark, silver_path)
-                silver_table_post.update(
-                    condition=(
-                        col("is_current") == True  # noqa: E712
-                    ) & (
-                        col("vin").isin(
-                            [row["vin"] for row in inactive_assignments.collect()]
-                        )
-                    ),
-                    set={
-                        "is_current": lit(False),
-                        "status":     lit("ARCHIVED"),
-                        "updated_at": current_timestamp(),
-                    }
+                # Split: assignments with future end_date OR open-ended (NULL) → re-queue, others → permanent archive
+                next_day = str((date.fromisoformat(run_date) + timedelta(days=1)))
+
+                requeue_df = inactive_assignments.filter(
+                    col("end_date").isNull() | (col("end_date") > lit(run_date))
                 )
-                print(f"[dim_vehicle_assignment_scd2] ✓ Archived {inactive_count} assignments — VIN no longer active in registry")
+                permanent_df = inactive_assignments.filter(
+                    col("end_date").isNotNull() & (col("end_date") <= lit(run_date))
+                )
+
+                requeue_count = requeue_df.count()
+                permanent_count = permanent_df.count()
+
+                # ── Re-queue: create future assignments for VINs with future end_date ──
+                if requeue_count > 0:
+                    requeue_vins = [row["vin"] for row in requeue_df.select("vin").distinct().collect()]
+                    print(f"[dim_vehicle_assignment_scd2] Re-queuing {requeue_count} assignments to future (VIN temporarily absent, end_date in future)")
+
+                    # Build future assignment rows from the current Silver records
+                    future_rows = (
+                        requeue_df.select(
+                            col("vin"),
+                            col("driver_id"),
+                            col("region"),
+                            col("daily_rate"),
+                            col("end_date").alias("original_end_date"),
+                            col("end_datetime").alias("original_end_datetime"),
+                        )
+                    )
+
+                    # Convert Silver columns back to bronze-like format for future_vehicle_assignments
+                    # The future path stores raw-ish records that get re-processed on the next run
+                    future_records = (
+                        future_rows
+                        .withColumn("start_timestamp",
+                            col("vin").cast("string"))  # placeholder, will be replaced below
+                        .withColumn("end_timestamp",
+                            col("vin").cast("string"))  # placeholder, will be replaced below
+                    )
+
+                    # We need unix timestamps for start/end to match bronze schema.
+                    # start_timestamp = next_day at midnight, end_timestamp = original_end_datetime
+                    from pyspark.sql.functions import unix_timestamp as _unix_ts
+                    future_records = (
+                        future_rows
+                        .withColumn("start_timestamp",
+                            _unix_ts(lit(next_day + " 00:00:00"), "yyyy-MM-dd HH:mm:ss").cast(LongType()))
+                        .withColumn("end_timestamp",
+                            when(col("original_end_datetime").isNotNull(),
+                                 _unix_ts(col("original_end_datetime").cast("string"), "yyyy-MM-dd HH:mm:ss").cast(LongType())
+                            ).otherwise(
+                                _unix_ts(concat(col("original_end_date").cast("string"), lit(" 23:59:59")), "yyyy-MM-dd HH:mm:ss").cast(LongType())
+                            ))
+                        .withColumn("status", lit("PENDING_RESUME"))
+                        .drop("original_end_date", "original_end_datetime")
+                    )
+
+                    # Append to future_vehicle_assignments
+                    future_path = derive_future_path(bronze_base)
+                    try:
+                        existing_future = spark.read.parquet(future_path)
+                        existing_future = existing_future.localCheckpoint(eager=True)
+                        combined_future = existing_future.unionByName(future_records, allowMissingColumns=True)
+                    except Exception:
+                        combined_future = future_records
+                    combined_future.write.mode("overwrite").parquet(future_path)
+                    print(f"[dim_vehicle_assignment_scd2] ✓ Saved {requeue_count} future assignments (VIN absent, end_date in future) → {future_path}")
+
+                    # Close these records in Silver (end_date = run_date)
+                    silver_table_requeue = DeltaTable.forPath(spark, silver_path)
+                    silver_table_requeue.update(
+                        condition=(
+                            (col("is_current") == True) &  # noqa: E712
+                            col("vin").isin(requeue_vins)
+                        ),
+                        set={
+                            "end_date":     lit(run_date).cast("date"),
+                            "end_datetime": current_timestamp(),
+                            "is_current":   lit(False),
+                            "status":       lit("PAUSED"),
+                            "updated_at":   current_timestamp(),
+                        }
+                    )
+                    print(f"[dim_vehicle_assignment_scd2] ✓ Closed {requeue_count} Silver records with PAUSED status")
+
+                # ── Permanent archive: VINs with no future end_date ──
+                if permanent_count > 0:
+                    permanent_vins = [row["vin"] for row in permanent_df.select("vin").distinct().collect()]
+                    silver_table_post = DeltaTable.forPath(spark, silver_path)
+                    silver_table_post.update(
+                        condition=(
+                            (col("is_current") == True) &  # noqa: E712
+                            col("vin").isin(permanent_vins)
+                        ),
+                        set={
+                            "is_current": lit(False),
+                            "status":     lit("ARCHIVED"),
+                            "updated_at": current_timestamp(),
+                        }
+                    )
+                    print(f"[dim_vehicle_assignment_scd2] ✓ Archived {permanent_count} assignments — VIN no longer active (no future end_date)")
             else:
                 print("[dim_vehicle_assignment_scd2] ✓ All current assignments have active VINs")
 
         except Exception as e:
             print(f"[dim_vehicle_assignment_scd2] ⚠ Could not enforce active VIN check: {e}. Skipping post-MERGE archive.")
+
+        # ── POST-MERGE: Handle assignments whose VIN is in maintenance today ──
+        # Same logic as absent VINs: if end_date is in the future, pause + re-queue.
+        if silver_maintenance_path:
+            try:
+                maintenance_df = (
+                    spark.read.format("delta").load(silver_maintenance_path)
+                    .filter(col("service_date") == lit(run_date))
+                    .select(col("vin").alias("maint_vin"))
+                    .distinct()
+                )
+                maint_vin_count = maintenance_df.count()
+                print(f"[dim_vehicle_assignment_scd2] VINs in maintenance on {run_date}: {maint_vin_count}")
+
+                if maint_vin_count > 0:
+                    # Refresh Silver after prior updates
+                    final_df_maint = spark.read.format("delta").load(silver_path)
+
+                    # Find current assignments for vehicles in maintenance today
+                    maint_assignments = (
+                        final_df_maint.filter(col("is_current") == True)  # noqa: E712
+                        .join(maintenance_df, col("vin") == col("maint_vin"), "inner")
+                        .drop("maint_vin")
+                    )
+                    maint_assignment_count = maint_assignments.count()
+
+                    if maint_assignment_count > 0:
+                        next_day = str((date.fromisoformat(run_date) + timedelta(days=1)))
+
+                        # Split: future end_date OR open-ended (NULL) → pause + re-queue, else → archive
+                        maint_requeue = maint_assignments.filter(
+                            col("end_date").isNull() | (col("end_date") > lit(run_date))
+                        )
+                        maint_permanent = maint_assignments.filter(
+                            col("end_date").isNotNull() & (col("end_date") <= lit(run_date))
+                        )
+
+                        maint_requeue_count = maint_requeue.count()
+                        maint_permanent_count = maint_permanent.count()
+
+                        if maint_requeue_count > 0:
+                            maint_requeue_vins = [row["vin"] for row in maint_requeue.select("vin").distinct().collect()]
+                            print(f"[dim_vehicle_assignment_scd2] Re-queuing {maint_requeue_count} assignments to future (VIN in maintenance, end_date in future)")
+
+                            # Build future assignment rows
+                            from pyspark.sql.functions import unix_timestamp as _unix_ts
+                            future_maint_rows = (
+                                maint_requeue.select(
+                                    col("vin"),
+                                    col("driver_id"),
+                                    col("region"),
+                                    col("daily_rate"),
+                                    col("end_date").alias("original_end_date"),
+                                    col("end_datetime").alias("original_end_datetime"),
+                                )
+                                .withColumn("start_timestamp",
+                                    _unix_ts(lit(next_day + " 00:00:00"), "yyyy-MM-dd HH:mm:ss").cast(LongType()))
+                                .withColumn("end_timestamp",
+                                    when(col("original_end_datetime").isNotNull(),
+                                         _unix_ts(col("original_end_datetime").cast("string"), "yyyy-MM-dd HH:mm:ss").cast(LongType())
+                                    ).otherwise(
+                                        _unix_ts(concat(col("original_end_date").cast("string"), lit(" 23:59:59")), "yyyy-MM-dd HH:mm:ss").cast(LongType())
+                                    ))
+                                .withColumn("status", lit("PENDING_RESUME"))
+                                .drop("original_end_date", "original_end_datetime")
+                            )
+
+                            # Append to future_vehicle_assignments
+                            future_path = derive_future_path(bronze_base)
+                            try:
+                                existing_future = spark.read.parquet(future_path)
+                                existing_future = existing_future.localCheckpoint(eager=True)
+                                combined_future = existing_future.unionByName(future_maint_rows, allowMissingColumns=True)
+                            except Exception:
+                                combined_future = future_maint_rows
+                            combined_future.write.mode("overwrite").parquet(future_path)
+                            print(f"[dim_vehicle_assignment_scd2] ✓ Saved {maint_requeue_count} maintenance future assignments → {future_path}")
+
+                            # Close these records in Silver
+                            silver_table_maint = DeltaTable.forPath(spark, silver_path)
+                            silver_table_maint.update(
+                                condition=(
+                                    (col("is_current") == True) &  # noqa: E712
+                                    col("vin").isin(maint_requeue_vins)
+                                ),
+                                set={
+                                    "end_date":     lit(run_date).cast("date"),
+                                    "end_datetime": current_timestamp(),
+                                    "is_current":   lit(False),
+                                    "status":       lit("MAINTENANCE"),
+                                    "updated_at":   current_timestamp(),
+                                }
+                            )
+                            print(f"[dim_vehicle_assignment_scd2] ✓ Closed {maint_requeue_count} Silver records with MAINTENANCE status")
+
+                        if maint_permanent_count > 0:
+                            maint_permanent_vins = [row["vin"] for row in maint_permanent.select("vin").distinct().collect()]
+                            silver_table_maint_perm = DeltaTable.forPath(spark, silver_path)
+                            silver_table_maint_perm.update(
+                                condition=(
+                                    (col("is_current") == True) &  # noqa: E712
+                                    col("vin").isin(maint_permanent_vins)
+                                ),
+                                set={
+                                    "is_current": lit(False),
+                                    "status":     lit("ARCHIVED"),
+                                    "updated_at": current_timestamp(),
+                                }
+                            )
+                            print(f"[dim_vehicle_assignment_scd2] ✓ Archived {maint_permanent_count} assignments — VIN in maintenance (no future end_date)")
+                    else:
+                        print("[dim_vehicle_assignment_scd2] ✓ No current assignments affected by maintenance")
+                else:
+                    print(f"[dim_vehicle_assignment_scd2] ✓ No vehicles in maintenance on {run_date}")
+
+            except Exception as e:
+                print(f"[dim_vehicle_assignment_scd2] ⚠ Could not enforce maintenance check: {e}. Skipping.")
 
         # ── POST-MERGE: Archive assignments whose driver is now SUSPENDED ──
         # Catches IN-TRANSIT assignments where the driver got suspended after assignment.
@@ -719,6 +931,7 @@ args = getResolvedOptions(sys.argv, [
     "bronze_ingested_path",
     "silver_output_path",
     "silver_vehicle_path",
+    "silver_maintenance_path",
     "pg_host",
     "pg_port",
     "pg_database",
@@ -741,6 +954,7 @@ job.init(args["JOB_NAME"], args)
 bronze_base = normalize_path(args["bronze_ingested_path"])
 silver_path = args["silver_output_path"].rstrip("/")
 silver_vehicle_path = args["silver_vehicle_path"].rstrip("/")
+silver_maintenance_path = args.get("silver_maintenance_path", "").rstrip("/") or None
 run_date = args.get("run_date", str(date.today()))
 
 # ── Build JDBC URL and connection properties for PostgreSQL ──
@@ -762,7 +976,7 @@ print("=" * 60)
 
 try:
     run(spark, run_date, bronze_base, silver_path, silver_vehicle_path,
-        jdbc_url, connection_props)
+        silver_maintenance_path, jdbc_url, connection_props)
     print("✓ dim_vehicle_assignment_scd2 transformation completed successfully.")
 except Exception as e:
     print(f"✗ dim_vehicle_assignment_scd2 transformation failed: {e}")
