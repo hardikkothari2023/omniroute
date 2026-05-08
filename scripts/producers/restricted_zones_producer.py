@@ -2,17 +2,28 @@ import sys
 import os
 
 CURRENT_DIR = os.path.abspath(os.path.dirname(__file__))
+PARENT_DIR  = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
 
 import json
 import random
+import boto3
 
 from config import (
     RESTRICTED_ZONES_RAW_FILE,
     ZONES_CONFIG,
     DATA_DIR
 )
+
+# ================================
+# S3 CONFIG — matches s3_paths.json landing path
+# ================================
+S3_BUCKET  = "ttn-de-bootcamp-bronze-us-east-1"
+S3_KEY     = "poc-bootcamp-group5-bronze/landing/restricted_zones.json"
+S3_LANDING = f"s3://{S3_BUCKET}/{S3_KEY}"
 
 # ================================
 # CONFIG (FROM CONFIG)
@@ -103,13 +114,9 @@ def add_edge_cases(zones):
 
     zones.append({})
 
-    zones.append({
-        "zone_name": "Too Large Zone",
-        "min_lat": 28.0,
-        "max_lat": 29.0,
-        "min_long": 76.0,
-        "max_long": 78.0
-    })
+    # NOTE: "Too Large Zone" (1° × 2°) was removed because it covered
+    # nearly the entire Delhi bounding box and caused false ZONE_INTRUSION
+    # on ~100% of telemetry records, making violation detection meaningless.
 
     return zones
 
@@ -123,7 +130,18 @@ def write_json(data):
     with open(OUTPUT_FILE, "w") as f:
         json.dump(data, f, indent=4)
 
-    print(f"Generated {len(data)} zones  {OUTPUT_FILE}")
+    print(f"Generated {len(data)} zones → {OUTPUT_FILE}")
+
+    # ── Upload to S3 Bronze landing/ ─────────────────────────────────
+    # The Silver Glue job reads restricted_zones.json from S3 landing.
+    # Upload here so Glue always has the latest zone definitions.
+    try:
+        s3 = boto3.client("s3")
+        s3.upload_file(OUTPUT_FILE, S3_BUCKET, S3_KEY)
+        print(f"Uploaded to S3 → {S3_LANDING}")
+    except Exception as e:
+        print(f"WARNING: S3 upload failed: {e}")
+        print(f"Manual upload required: aws s3 cp {OUTPUT_FILE} {S3_LANDING}")
 
 
 # ================================

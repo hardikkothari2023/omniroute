@@ -138,12 +138,12 @@ ZONES_CONFIG = {
 # TELEMETRY CONFIG (DYNAMIC KAFKA)
 # ================================
 
-KAFKA_SERVER = os.getenv("KAFKA_SERVER", "localhost:9092")
+KAFKA_SERVER = os.getenv("KAFKA_SERVER", "172.31.65.131:9092")
 
 TELEMETRY_CONFIG = {
     "KAFKA_TOPIC": "vehicle_telemetry_topic",
     "KAFKA_SERVER": KAFKA_SERVER,
-    "EVENT_DELAY": 1,
+    "EVENT_DELAY": 5,
     "LAT_RANGE": (28.4, 28.9),
     "LONG_RANGE": (76.8, 77.5),
     "NORMAL_SPEED": (40, 100),
@@ -178,10 +178,10 @@ PIPELINE_CONFIG = {
 # ================================
 
 POSTGRES_CONFIG = {
-    "HOST": os.getenv("PG_HOST", "localhost"),
+    "HOST": os.getenv("PG_HOST", "172.31.35.242"),
     "PORT": os.getenv("PG_PORT", "5432"),
-    "DATABASE": os.getenv("PG_DB", "omniroute_dwh"),
-    "USER": os.getenv("PG_USER", "postgres"),
-    "PASSWORD": os.getenv("PG_PASSWORD", "postgres"),
-    "DRIVER_STATUS_TABLE": "gold.driver_safety_status"
+    "DATABASE": os.getenv("PG_DB", "omniroute_reporting"),
+    "USER": os.getenv("PG_USER", "omniroute_user"),
+    "PASSWORD": os.getenv("PG_PASSWORD", "OmniRoute2026!"),
+    "DRIVER_STATUS_TABLE": "report.driver_safety_status"
 }

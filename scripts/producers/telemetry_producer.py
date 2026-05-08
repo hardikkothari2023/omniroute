@@ -2,8 +2,11 @@ import sys
 import os
 
 CURRENT_DIR = os.path.abspath(os.path.dirname(__file__))
+PARENT_DIR  = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
 
 import json
 import time
@@ -129,63 +132,96 @@ def generate_event(vin, driver_id, zones):
     return event
 
 
-def inject_edge_cases(producer, topic_name, zones):
-    # 1. Double Violation Cap Test
-    # speed > 110 AND inside restricted zone
+def inject_random_edge_case(producer, topic_name, zones):
+    """
+    Randomly picks ONE edge case and injects it into the main stream.
+    Called probabilistically during the main loop to simulate real-world anomalies.
+    """
     zone = zones[0] if zones else {"min_lat": 10, "max_lat": 11, "min_long": 10, "max_long": 11}
-    event_double = {
-        "vin": "VIN-DOUBLE-VIOLATION",
-        "driver_id": "DRV_DOUBLE",
-        "speed": 115,
-        "lat": zone["min_lat"] + 0.0001,
-        "long": zone["min_long"] + 0.0001,
-        "event_timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    producer.send(topic_name, key=b"VIN-DOUBLE-VIOLATION", value=event_double)
-    
-    # 2. Suspension Test (11 strikes in a row)
-    for i in range(11):
-        event_suspension = {
+
+    # Increased probability distribution for different edge cases
+    edge_case = random.choices(
+        ["double_violation", "suspension", "late_data", "anonymous", "dlq_bad", "impossible_speed"],
+        weights=[20, 20, 20, 15, 15, 10]
+    )[0]
+
+    if edge_case == "double_violation":
+        # BRD: Speed > 110 AND inside restricted zone simultaneously -> violation_type = 'BOTH'
+        event = {
+            "vin": "VIN-DOUBLE-VIOLATION",
+            "driver_id": "DRV_DOUBLE",
+            "speed": random.randint(115, 140),
+            "lat": zone["min_lat"] + 0.0001,
+            "long": zone["min_long"] + 0.0001,
+            "event_timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        producer.send(topic_name, key=b"VIN-DOUBLE-VIOLATION", value=event)
+        print(f"[EDGE CASE INJECTED] double_violation → speed={event['speed']}, inside zone")
+
+    elif edge_case == "suspension":
+        # One strike towards suspension (DRV-SUSPENSION accumulates over time)
+        event = {
             "vin": "VIN-SUSPENSION",
             "driver_id": "DRV-SUSPENSION",
-            "speed": 125,
-            "lat": 0,
-            "long": 0,
-            "event_timestamp": (datetime.utcnow() + timedelta(seconds=i)).strftime("%Y-%m-%d %H:%M:%S")
+            "speed": random.randint(120, 150),
+            "lat": 0, "long": 0,
+            "event_timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         }
-        producer.send(topic_name, key=b"VIN-SUSPENSION", value=event_suspension)
-    
-    # 3. Late arriving data
-    event_late = {
-        "vin": "VIN-LATE",
-        "driver_id": "DRV_LATE",
-        "speed": 60,
-        "lat": 0, "long": 0,
-        "event_timestamp": (datetime.utcnow() - timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
-    }
-    producer.send(topic_name, key=b"VIN-LATE", value=event_late)
-    
-    # 3.5 The Anonymous Truck (Missing Driver-ID to force Stream-Static Join)
-    event_anonymous = {
-        "vin": "1HGBH225", # A real VIN from the registry sample
-        "driver_id": "",   # Missing! The stream MUST join with Asset History to find out who this is.
-        "speed": 115,
-        "lat": 0, "long": 0,
-        "event_timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    producer.send(topic_name, key=b"1HGBH225", value=event_anonymous)
+        producer.send(topic_name, key=b"VIN-SUSPENSION", value=event)
+        print(f"[EDGE CASE INJECTED] suspension_strike → DRV-SUSPENSION speed={event['speed']}")
 
-    # 4. Bad JSON / Schema Breaker for DLQ
-    event_dlq = {
-        "driver_id": "DRV_BAD",
-        "speed": "WAY TOO FAST", 
-        "lat": 0, "long": 0,
-        "event_timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    producer.send(topic_name, key=b"DLQ_TEST", value=event_dlq)
-    
+    elif edge_case == "late_data":
+        # Simulates a telemetry event that arrives 5-25 minutes late (Watermark testing)
+        # Realistic: network delays cause minutes of latency, not days.
+        # Tests Gold's 30-minute watermark without creating old date partitions.
+        minutes_late = random.randint(5, 25)
+        event = {
+            "vin": f"VIN-LATE-{random.randint(1, 100)}",
+            "driver_id": "DRV_LATE",
+            "speed": random.randint(60, 90),
+            "lat": 0, "long": 0,
+            "event_timestamp": (datetime.utcnow() - timedelta(minutes=minutes_late)).strftime("%Y-%m-%d %H:%M:%S")
+        }
+        producer.send(topic_name, key=event["vin"].encode('utf-8'), value=event)
+        print(f"[EDGE CASE INJECTED] late_data → event_timestamp is {minutes_late} minutes old")
+
+    elif edge_case == "anonymous":
+        # Missing driver_id → forces stream-static join to resolve from assignments
+        event = {
+            "vin": f"VIN-ANON-{random.randint(100, 999)}",
+            "driver_id": "",  # Intentionally blank or null
+            "speed": random.randint(110, 130),
+            "lat": 0, "long": 0,
+            "event_timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        producer.send(topic_name, key=event["vin"].encode('utf-8'), value=event)
+        print(f"[EDGE CASE INJECTED] anonymous_truck → driver_id missing, vin={event['vin']}")
+
+    elif edge_case == "dlq_bad":
+        # Missing VIN or event_timestamp → should be caught by Bronze DLQ
+        bad_types = [
+            {"driver_id": "DRV_BAD", "speed": 100, "lat": 0, "long": 0, "event_timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")}, # Missing VIN
+            {"vin": "VIN-BAD-TS", "driver_id": "DRV_BAD", "speed": 100, "lat": 0, "long": 0}, # Missing Timestamp
+            {"vin": "VIN-MALFORMED", "driver_id": "DRV_BAD", "speed": "WAY TOO FAST", "lat": "N/A", "long": "N/A", "event_timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")} # Bad types
+        ]
+        event = random.choice(bad_types)
+        producer.send(topic_name, key=b"DLQ_TEST", value=event)
+        print(f"[EDGE CASE INJECTED] dlq_bad → Malformed payload sent to DLQ")
+
+    elif edge_case == "impossible_speed":
+        # Negative or impossible speed (500+ km/h) -> should be caught by Bronze validation
+        speed = random.choice([-50, 500, 800])
+        event = {
+            "vin": f"VIN-IMP-{random.randint(10, 99)}",
+            "driver_id": "DRV_IMP",
+            "speed": speed,
+            "lat": 0, "long": 0,
+            "event_timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        producer.send(topic_name, key=event["vin"].encode('utf-8'), value=event)
+        print(f"[EDGE CASE INJECTED] impossible_speed → speed={speed} km/h")
+
     producer.flush()
-    print("Injected advanced BRD edge cases into Kafka.")
 
 # ================================
 # MAIN PRODUCER
@@ -211,7 +247,9 @@ def run_producer():
     print(f"Loaded {len(zones)} restricted zones")
 
     # Inject static BRD edge cases before the infinite loop
-    inject_edge_cases(producer, KAFKA_TOPIC, zones)
+    print("Injecting initial edge cases into Kafka stream...")
+    inject_random_edge_case(producer, KAFKA_TOPIC, zones)
+    inject_random_edge_case(producer, KAFKA_TOPIC, zones)
 
     print("Starting telemetry stream in batches... Press Ctrl+C to stop.\n")
     BATCH_SIZE = 50
@@ -226,15 +264,20 @@ def run_producer():
 
             batch_events = []
             for _ in range(BATCH_SIZE):
-                vin = random.choice(vins)
-                driver_id = assignments.get(vin, "DRV_UNKNOWN")
+                # 15% chance to inject an edge case instead of a normal event
+                if random.random() < 0.15:
+                    inject_random_edge_case(producer, KAFKA_TOPIC, zones)
+                else:
+                    vin = random.choice(vins)
+                    driver_id = assignments.get(vin, "DRV_UNKNOWN")
 
-                event = generate_event(vin, driver_id, zones)
-                # Assign partition key to guarantee ordered processing downstream
-                producer.send(KAFKA_TOPIC, key=vin.encode("utf-8"), value=event)
-                batch_events.append(event)
+                    event = generate_event(vin, driver_id, zones)
+                    # Assign partition key to guarantee ordered processing downstream
+                    producer.send(KAFKA_TOPIC, key=vin.encode("utf-8"), value=event)
+                    batch_events.append(event)
 
-            print(f"Sent batch of {BATCH_SIZE} events. Example: {batch_events[0]}")
+            if batch_events:
+                print(f"Sent batch of {BATCH_SIZE} events. Example: {batch_events[0]}")
             time.sleep(EVENT_DELAY)
 
     except KeyboardInterrupt:

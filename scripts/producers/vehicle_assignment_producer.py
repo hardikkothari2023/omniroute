@@ -2,12 +2,17 @@ import sys
 import os
 
 CURRENT_DIR = os.path.abspath(os.path.dirname(__file__))
+PARENT_DIR  = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
 
 import csv
+import json
 import random
 from datetime import datetime, timedelta
+import boto3
 
 from config import (
     VEHICLE_REGISTRY_FILE,
@@ -15,6 +20,13 @@ from config import (
     VEHICLE_ASSIGNMENT_CONFIG,
     DATA_DIR
 )
+
+# ================================
+# S3 CONFIG — matches s3_paths.json landing path
+# ================================
+S3_BUCKET  = "ttn-de-bootcamp-bronze-us-east-1"
+S3_KEY     = "poc-bootcamp-group5-bronze/landing/vehicle_assignment.csv"
+S3_LANDING = f"s3://{S3_BUCKET}/{S3_KEY}"
 
 # ================================
 # CONFIG (FROM CONFIG)
@@ -67,15 +79,12 @@ def generate_assignments(vins):
     data = []
     driver_counter = 1
 
-    # Dynamic base date: starting 6 months ago from today
+    # Dynamic base date anchoring for realistic pipeline processing
     now_utc = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    base_date = now_utc - timedelta(days=180)
 
     for vin in vins:
 
         num_assignments = random.randint(1, 4)
-
-        start_date = base_date + timedelta(days=random.randint(0, 200))
 
         for i in range(num_assignments):
 
@@ -90,6 +99,29 @@ def generate_assignments(vins):
             )
 
             region = random.choice(REGIONS)
+
+            # ── Date Distribution ────────────────────────────────────
+            # 85% current date   — main workload for today's pipeline
+            #  5% future          — upcoming assignments (today+1..+30)
+            # 10% past            — historical backfill   (today-180..-1)
+            roll = random.random()
+            if roll < 0.85:
+                start_date = now_utc + timedelta(
+                    hours=random.randint(0, 23),
+                    minutes=random.randint(0, 59)
+                )
+            elif roll < 0.90:
+                start_date = now_utc + timedelta(
+                    days=random.randint(1, 30),
+                    hours=random.randint(0, 23),
+                    minutes=random.randint(0, 59)
+                )
+            else:
+                start_date = now_utc - timedelta(
+                    days=random.randint(1, 180),
+                    hours=random.randint(0, 23),
+                    minutes=random.randint(0, 59)
+                )
 
             duration = random.randint(10, 60)
             end_date = start_date + timedelta(days=duration)
@@ -110,8 +142,6 @@ def generate_assignments(vins):
 
             data.append(record)
 
-            start_date = end_date + timedelta(days=random.randint(1, 5))
-
     return data
 
 
@@ -122,6 +152,7 @@ def generate_assignments(vins):
 def add_edge_cases(data, vins):
 
     now_utc = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    total = len(data)
     
     # --- BRD REQUIREMENT: The Driver Swap ---
     swap_date = to_unix(datetime(2026, 4, 15))
@@ -161,15 +192,32 @@ def add_edge_cases(data, vins):
         "region": "South"
     })
 
-    # Existing basic error cases
-    data.append({
-        "vin": "INVALID123",
-        "driver_id": "DRV_BAD",
-        "start_timestamp": to_unix(now_utc + timedelta(days=10)),
-        "end_timestamp": "",
-        "daily_rate": 500,
-        "region": "South"
-    })
+    # 1. SCD2 Overlaps / Conflicts (10%)
+    # Same VIN, different drivers, completely overlapping timeframes
+    for _ in range(int(total * 0.10)):
+        row = random.choice(data).copy()
+        row["driver_id"] = f"DRV_OVERLAP_{random.randint(1000, 9999)}"
+        # Keep same vin, same start_timestamp to force a conflict in the downstream SCD2 logic
+        data.append(row)
+
+    # 2. Orphaned Assignments (5%)
+    # Assignment for a VIN that doesn't exist in the Vehicle Registry
+    for _ in range(int(total * 0.05)):
+        row = random.choice(data).copy()
+        row["vin"] = f"VIN-ORPHAN-{random.randint(100, 999)}"
+        row["driver_id"] = f"DRV_ORPHAN_{random.randint(1000, 9999)}"
+        data.append(row)
+
+    # 3. Invalid Dates (5%)
+    # Start date is AFTER the end date
+    for _ in range(int(total * 0.05)):
+        row = random.choice(data).copy()
+        if row["end_timestamp"] != "":
+            # Swap start and end
+            temp = row["start_timestamp"]
+            row["start_timestamp"] = row["end_timestamp"]
+            row["end_timestamp"] = temp
+            data.append(row)
 
     return data
 
@@ -187,7 +235,18 @@ def write_csv(data):
         writer.writeheader()
         writer.writerows(data)
 
-    print(f"Generated {len(data)} rows  {OUTPUT_FILE}")
+    print(f"Generated {len(data)} rows → {OUTPUT_FILE}")
+
+    # ── Upload to S3 Bronze landing/ ─────────────────────────────────
+    # The Silver Glue job reads vehicle_assignment.csv directly from S3.
+    # We must upload here so Glue always has the latest reference data.
+    try:
+        s3 = boto3.client("s3")
+        s3.upload_file(OUTPUT_FILE, S3_BUCKET, S3_KEY)
+        print(f"Uploaded to S3 → {S3_LANDING}")
+    except Exception as e:
+        print(f"WARNING: S3 upload failed: {e}")
+        print(f"Manual upload required: aws s3 cp {OUTPUT_FILE} {S3_LANDING}")
 
 
 # ================================

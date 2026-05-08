@@ -2,11 +2,15 @@ import sys
 import os
 
 CURRENT_DIR = os.path.abspath(os.path.dirname(__file__))
+PARENT_DIR  = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
+if PARENT_DIR not in sys.path:
+    sys.path.insert(0, PARENT_DIR)
 
 import csv
 import random
+import boto3
 from datetime import datetime, timedelta
 
 from config import (
@@ -15,6 +19,13 @@ from config import (
     MAINTENANCE_CONFIG,
     DATA_DIR
 )
+
+# ================================
+# S3 CONFIG — matches s3_paths.json landing path
+# ================================
+S3_BUCKET  = "ttn-de-bootcamp-bronze-us-east-1"
+S3_KEY     = "poc-bootcamp-group5-bronze/landing/maintenance_schedules.csv"
+S3_LANDING = f"s3://{S3_BUCKET}/{S3_KEY}"
 
 # ================================
 # CONFIG (FROM CONFIG)
@@ -78,7 +89,6 @@ def generate_data(vins):
 # ================================
 
 def add_edge_cases(data, vins):
-
     total = len(data)
 
     # --- BRD REQUIREMENT: Maintenance Exclusion Test ---
@@ -90,20 +100,23 @@ def add_edge_cases(data, vins):
             "service_type": "Engine Overhaul"
         })
 
-    for _ in range(int(total * 0.01)):
+    # 1. Duplicates (5%)
+    for _ in range(int(total * 0.05)):
         data.append(random.choice(data).copy())
 
-    for _ in range(int(total * 0.005)):
+    # 2. Invalid VINs (5%)
+    for _ in range(int(total * 0.05)):
         data.append({
-            "vin": "INVALID_" + str(random.randint(1000, 9999)),
+            "vin": "INVALID_VIN_" + str(random.randint(1000, 9999)),
             "service_date": "2026-05-10",
-            "service_type": "Oil Change"
+            "service_type": random.choice(["Oil Change", "Brake Inspection"])
         })
 
-    for _ in range(int(total * 0.005)):
+    # 3. Invalid/Future Dates (5%)
+    for _ in range(int(total * 0.05)):
         data.append({
-            "vin": random.choice(vins),
-            "service_date": "INVALID_DATE",
+            "vin": random.choice(vins) if vins else "VIN_PLACEHOLDER",
+            "service_date": random.choice(["INVALID_DATE", "2099-12-31", "1800-01-01"]),
             "service_type": "Brake Inspection"
         })
 
@@ -123,7 +136,16 @@ def write_csv(data):
         writer.writeheader()
         writer.writerows(data)
 
-    print(f"Generated {len(data)} records  {OUTPUT_FILE}")
+    print(f"Generated {len(data)} records → {OUTPUT_FILE}")
+
+    # ── Upload to S3 Bronze landing/ ─────────────────────────────────
+    try:
+        s3 = boto3.client("s3")
+        s3.upload_file(OUTPUT_FILE, S3_BUCKET, S3_KEY)
+        print(f"Uploaded to S3 → {S3_LANDING}")
+    except Exception as e:
+        print(f"WARNING: S3 upload failed: {e}")
+        print(f"Manual upload required: aws s3 cp {OUTPUT_FILE} {S3_LANDING}")
 
 
 # ================================
