@@ -136,7 +136,7 @@ def write_txt_manager_report(report_df, report_month_str, gold_report_path):
     lines.append(f"  Active Drivers     : {total_active}")
     lines.append(f"  Suspended Drivers  : {total_suspended}")
     lines.append(f"  Total Strikes      : {total_strikes_all}")
-    lines.append(f"  Total Payable (USD): {total_payable:,.2f}")
+    lines.append(f"  Total Payable (INR): {total_payable:,.2f}")
     lines.append(f"  Total Deductions   : {total_deduction:,.2f}")
     lines.append("")
     lines.append("DRIVER BREAKDOWN")
@@ -146,8 +146,8 @@ def write_txt_manager_report(report_df, report_month_str, gold_report_path):
         f"{'Status':<12}"
         f"{'Strikes':>8}"
         f"{'Days Active':>13}"
-        f"{'Payable (USD)':>16}"
-        f"{'Deduction (USD)':>17}"
+        f"{'Payable (INR)':>16}"
+        f"{'Deduction (INR)':>17}"
     )
     lines.append(header)
     lines.append("-" * 70)
